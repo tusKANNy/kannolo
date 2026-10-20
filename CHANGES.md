@@ -2,7 +2,7 @@
 
 ## 0.14.0
 
-kANNolo moves to vectorium 0.11 (branch `compression`). That release removes DotVByte and adds the
+kANNolo moves to vectorium 0.11.0. That release removes DotVByte and adds the
 DotPacking8, blocked and step-scalar sparse encoders.
 
 ### Breaking changes

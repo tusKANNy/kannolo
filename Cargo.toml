@@ -20,7 +20,7 @@ rayon       = "1.10.0"
 bincode     = "2.0.1"
 rustc-hash  = "2.1.0"
 tantivy-bitpacker = "0.8.0"
-vectorium   = { git = "https://github.com/TusKANNy/vectorium.git", branch = "compression" }
+vectorium   = { git = "https://github.com/TusKANNy/vectorium.git", rev = "ab18e9ecff6e58a9a60b5faf99a53beab86b9924" }
 indicatif   = { version = "0.18.3", features = ["rayon"] }
 postcard    = { version = "1", features = ["alloc"] }
 rgb         = { package = "rgbisect", version = "0.1.0" }
