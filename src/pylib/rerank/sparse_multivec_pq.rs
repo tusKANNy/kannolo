@@ -12,8 +12,8 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
+use crate::rerank_index::RerankIndex;
 use vectorium::PlainSparseDataset;
-use vectorium::core::rerank_index::RerankIndex;
 use vectorium::distances::{DotProduct, SquaredEuclideanDistance};
 use vectorium::vector::DenseMultiVectorView;
 use vectorium::vector::DenseVectorView;

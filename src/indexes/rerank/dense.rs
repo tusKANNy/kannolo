@@ -19,9 +19,9 @@ use crate::graph::graph::GraphTrait;
 use crate::graph::neighbors::{PlainNeighbors, StreamVByteNeighbors};
 use crate::hnsw::{HNSW, HNSWBuildConfiguration, HNSWSearchConfiguration};
 
+use crate::rerank_index::RerankIndex;
 use vectorium::SpaceUsage;
 use vectorium::core::dataset::ConvertFrom;
-use vectorium::core::rerank_index::RerankIndex;
 use vectorium::dataset::ScoredVector;
 use vectorium::distances::{Distance, DotProduct, SquaredEuclideanDistance};
 use vectorium::encoders::dense_scalar::{PlainDenseQuantizer, ScalarDenseSupportedDistance};

@@ -7,14 +7,11 @@ use rand::seq::index as rand_index;
 use serde::{Deserialize, Serialize};
 use vectorium::core::dataset::{ConvertFrom, ScoredItemGeneric, ScoredVector};
 use vectorium::core::index::Index;
-use vectorium::core::vector::DenseVectorView;
-use vectorium::core::vector_encoder::{DenseVectorEncoder, VectorEncoder};
+use vectorium::core::vector_encoder::{VectorEncoder, WithDistance};
 use vectorium::distances::DotProduct;
-use vectorium::encoders::pq::ProductQuantizer;
 use vectorium::{
-    Dataset, DatasetGrowable, DenseDataset, Distance, Float, FromF32, IndexSerializer, KMeans,
-    KMeansBuilder, PlainDenseDataset, PlainDenseDatasetGrowable, QueryEvaluator,
-    ScalarDenseQuantizer, SquaredEuclideanDistance, ValueType, VectorId,
+    Dataset, DatasetGrowable, Distance, IndexSerializer, KMeans, KMeansBuilder, MeanDataset,
+    QueryEvaluator, SpaceUsage, SquaredEuclideanDistance, VectorId,
 };
 
 use crate::graph::Graph;
@@ -353,49 +350,8 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Dense build infrastructure
+// Build
 // ---------------------------------------------------------------------------
-
-type DensePlain = PlainDenseDataset<f32, SquaredEuclideanDistance>;
-
-/// Artifacts produced by [`prepare_dense_ivf`], ready to be assembled into an
-/// [`IVF`] index of any centroid index / encoding combination.
-pub struct DenseBuildArtifacts {
-    /// Centroids in f32, as returned by k-means. Convert to the desired
-    /// centroid precision (e.g. f16) and build the centroid index externally.
-    pub centroids_f32: DensePlain,
-    /// Vectors reordered so that each cluster occupies a contiguous range.
-    /// If `with_residuals = true`, this contains `v − c` instead of `v`.
-    pub reordered_dataset: DensePlain,
-    /// CSR offsets, length `n_clusters + 1`.
-    pub cluster_offsets: Box<[u32]>,
-    /// `external_ids[i]` = original vector ID at reordered position `i`.
-    pub external_ids: Box<[u32]>,
-}
-
-/// Dispatch k-means training to flat or HNSW assignment based on `use_hnsw`.
-fn run_kmeans(
-    kmeans: &KMeans,
-    dataset: &DensePlain,
-    n_clusters: usize,
-    use_hnsw: bool,
-) -> DensePlain {
-    if use_hnsw {
-        let build_cfg = HNSWBuildConfiguration::default()
-            .with_num_neighbors(KMEANS_HNSW_M)
-            .with_ef_construction(KMEANS_HNSW_EF_CONSTRUCTION);
-        let search_cfg = HNSWSearchConfiguration::default().with_ef_search(KMEANS_HNSW_EF_SEARCH);
-        kmeans.train_with_index::<HNSW<DensePlain, Graph>, f32, f32>(
-            dataset,
-            n_clusters,
-            None,
-            |centroids| HNSW::build_index(centroids, &build_cfg),
-            &search_cfg,
-        )
-    } else {
-        kmeans.train(dataset, n_clusters, None)
-    }
-}
 
 /// Auto-threshold: use HNSW for centroid assignment when `n_clusters` reaches
 /// this value. Below it a flat exhaustive scan is fast enough; above it
@@ -408,75 +364,139 @@ const KMEANS_HNSW_M: usize = 32;
 const KMEANS_HNSW_EF_CONSTRUCTION: usize = 200;
 const KMEANS_HNSW_EF_SEARCH: usize = 16;
 
-/// Run k-means, assign vectors to clusters, and produce a reordered dataset
-/// ready to be assembled into any [`IVF`] variant.
+fn kmeans_hnsw_build_config() -> HNSWBuildConfiguration {
+    HNSWBuildConfiguration::default()
+        .with_num_neighbors(KMEANS_HNSW_M)
+        .with_ef_construction(KMEANS_HNSW_EF_CONSTRUCTION)
+}
+
+fn kmeans_hnsw_search_config() -> HNSWSearchConfiguration {
+    HNSWSearchConfiguration::default().with_ef_search(KMEANS_HNSW_EF_SEARCH)
+}
+
+/// The clustering produced by [`prepare_ivf`]: centroids plus the order that groups the vectors
+/// into contiguous clusters. Materialize the cluster vectors with [`reorder`](Self::reorder)
+/// (or [`IVFInput::residuals`]), encode them, and pass everything to [`IVF::from_parts`].
+pub struct BuildArtifacts<C> {
+    /// k-means centroids, under the clustering metric. Convert them to the centroid index's
+    /// metric and precision to build the centroid index.
+    pub centroids: C,
+    /// CSR offsets, length `n_clusters + 1`.
+    pub cluster_offsets: Box<[u32]>,
+    /// `external_ids[i]` = original vector ID at reordered position `i`.
+    pub external_ids: Box<[u32]>,
+}
+
+impl<C> BuildArtifacts<C> {
+    /// `dataset` reordered so that each cluster occupies a contiguous range.
+    pub fn reorder<D: Dataset>(&self, dataset: &D) -> D::Owned {
+        // `permute` moves the row at `old` to `permutation[old]`.
+        let mut permutation = vec![0usize; self.external_ids.len()];
+        for (new_pos, &orig) in self.external_ids.iter().enumerate() {
+            permutation[orig as usize] = new_pos;
+        }
+        dataset.permute(&permutation)
+    }
+
+    /// Like [`reorder`](Self::reorder), but each vector `v` is replaced by its residual
+    /// `v − c` against its cluster's centroid, pushed into a `G` built with `encoder`.
+    pub fn residuals<D, G>(&self, dataset: &D, encoder: G::Encoder) -> G::Owned
+    where
+        C: MeanDataset<Vector = D::Vector>,
+        D: MeanDataset,
+        G: DatasetGrowable + Into<G::Owned>,
+        for<'a> <G::Encoder as VectorEncoder>::InputVector<'a>: From<&'a D::Vector>,
+    {
+        let offsets = &self.cluster_offsets;
+        let mut residuals = G::with_capacity(encoder, self.external_ids.len());
+        for cid in 0..offsets.len() - 1 {
+            let c = self.centroids.vector(cid as u32);
+            for &orig in &self.external_ids[offsets[cid] as usize..offsets[cid + 1] as usize] {
+                residuals.push((&dataset.residual(orig, &c)).into());
+            }
+        }
+        residuals.into()
+    }
+}
+
+/// Run k-means and assign every vector of `dataset` to its nearest centroid.
 ///
-/// Call this when you need to control the centroid precision or cluster encoding
-/// externally (e.g. f16 centroids, PQ-compressed clusters). The returned
-/// [`DenseBuildArtifacts`] owns the f32 centroids; convert and consume them to
-/// build your centroid index, then pass the remaining fields to [`IVF::from_parts`].
-///
-/// If `with_residuals = true`, `artifacts.reordered_dataset` contains residuals
-/// `v − c` instead of `v`. The L2 correction term is not produced here — the
-/// caller computes it from the *stored* cluster vectors via [`l2_correction`],
-/// which is what keeps it exact for lossy f16 / PQ storage.
+/// The clustering metric is `centroid_encoder`'s, independent of `dataset`'s.
 ///
 /// `sample_size`: if `Some(s)` and `s < n`, k-means is trained on a random
 /// sample of `s` vectors drawn without replacement from `dataset`. Assignment
 /// of all `n` vectors to the resulting centroids always uses the full dataset.
 /// A sample of ~256 × n_clusters is typically sufficient for good centroid
 /// quality and reduces training time from O(n · k) to O(s · k) per iteration.
-pub fn prepare_dense_ivf(
-    dataset: &DensePlain,
+///
+/// `kmeans_hnsw`: assign vectors to centroids, during k-means and for the final pass, through an
+/// HNSW over the centroids instead of a flat scan.
+///
+/// `refine` runs on every centroid after each k-means update, with the IDs (in `dataset`) of
+/// the vectors assigned to it; see [`vectorium::sparse_centroid_pruning`]. Pass `|_, _| {}`
+/// for none.
+pub fn prepare_ivf<D, G>(
+    dataset: &D,
     n_clusters: usize,
     kmeans_builder: KMeansBuilder,
-    with_residuals: bool,
+    centroid_encoder: G::Encoder,
     sample_size: Option<usize>,
     kmeans_hnsw: bool,
-) -> DenseBuildArtifacts {
-    let dim = dataset.input_dim();
+    refine: impl Fn(&[u32], &mut D::Vector) + Sync,
+) -> BuildArtifacts<G::Owned>
+where
+    D: MeanDataset + Sync,
+    G: DatasetGrowable + MeanDataset<Vector = D::Vector> + Clone + Sync + Into<G::Owned>,
+    G::Owned: Clone + Sync + SpaceUsage,
+    G::Encoder: VectorEncoder<QueryParams = ()> + Clone,
+    <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
+    for<'a> <G::Encoder as VectorEncoder>::InputVector<'a>: From<&'a D::Vector>,
+    for<'a> <G::Encoder as VectorEncoder>::QueryVector<'a>: From<&'a D::Vector>,
+{
     let n = dataset.len();
-
     let kmeans = kmeans_builder.build();
 
-    let centroids = match sample_size.filter(|&s| s < n) {
+    let centroids: G::Owned = match sample_size.filter(|&s| s < n) {
         Some(ss) => {
             println!("Sampling {ss} / {n} vectors for k-means training");
             let mut rng = StdRng::from_entropy();
-            let indices = rand_index::sample(&mut rng, n, ss);
-            let mut builder =
-                PlainDenseDatasetGrowable::<f32, SquaredEuclideanDistance>::with_capacity(
-                    ScalarDenseQuantizer::new(dim),
-                    ss,
-                );
-            for idx in indices {
-                builder.push(dataset.get(idx as VectorId));
+            let ids: Vec<u32> = rand_index::sample(&mut rng, n, ss)
+                .into_iter()
+                .map(|i| i as u32)
+                .collect();
+            let mut sample = G::with_capacity(centroid_encoder.clone(), ss);
+            for &i in &ids {
+                sample.push((&dataset.vector(i)).into());
             }
-            let sampled: DensePlain = builder.into();
-            run_kmeans(&kmeans, &sampled, n_clusters, kmeans_hnsw)
+            // `refine` takes IDs in `dataset`: translate the sample's.
+            train_centroids::<_, G>(
+                &kmeans,
+                &sample,
+                n_clusters,
+                centroid_encoder,
+                kmeans_hnsw,
+                |members: &[u32], centroid: &mut D::Vector| {
+                    let members: Vec<u32> = members.iter().map(|&m| ids[m as usize]).collect();
+                    refine(&members, centroid)
+                },
+            )
         }
-        None => run_kmeans(&kmeans, dataset, n_clusters, kmeans_hnsw),
+        None => train_centroids::<_, G>(
+            &kmeans,
+            dataset,
+            n_clusters,
+            centroid_encoder,
+            kmeans_hnsw,
+            &refine,
+        ),
     };
 
-    // Assign all vectors to their nearest centroid.
-    // Use HNSW when requested: build once on final centroids, search the full dataset.
     let assignments = if kmeans_hnsw {
-        let build_cfg = HNSWBuildConfiguration::default()
-            .with_num_neighbors(KMEANS_HNSW_M)
-            .with_ef_construction(KMEANS_HNSW_EF_CONSTRUCTION);
-        let search_cfg = HNSWSearchConfiguration::default().with_ef_search(KMEANS_HNSW_EF_SEARCH);
-        let centroid_index = HNSW::<DensePlain, Graph>::build_index(centroids.clone(), &build_cfg);
-        KMeans::assign_with_index(dataset, &centroid_index, &search_cfg)
+        let centroid_index =
+            HNSW::<G::Owned, Graph>::build_index(centroids.clone(), &kmeans_hnsw_build_config());
+        KMeans::assign_with_index(dataset, &centroid_index, &kmeans_hnsw_search_config())
     } else {
-        KMeans::compute_assignments(dataset, &centroids, 0)
-    };
-
-    // Centroid raw values, needed to form residuals below. The L2 correction is
-    // computed later by the caller from the stored cluster vectors (l2_correction).
-    let centroid_raw: Vec<f32> = if with_residuals {
-        centroids.values().to_vec()
-    } else {
-        Vec::new()
+        KMeans::compute_assignments(dataset, &centroids)
     };
 
     // CSR offsets from per-cluster counts.
@@ -489,122 +509,125 @@ pub fn prepare_dense_ivf(
         cluster_offsets[c + 1] = cluster_offsets[c] + cluster_sizes[c];
     }
 
-    // Permutation grouping vectors by cluster. Unstable sort: order within a
+    // Order grouping vectors by cluster. Unstable sort: order within a
     // cluster is arbitrary and irrelevant for correctness.
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_unstable_by_key(|&i| assignments[i as usize].1);
 
-    // Build reordered data (residuals when requested).
-    let mut reordered = Vec::with_capacity(n * dim);
-    for &orig in &order {
-        let v = dataset.get(orig as VectorId).values();
-        if with_residuals {
-            let c_id = assignments[orig as usize].1;
-            let c = &centroid_raw[c_id * dim..(c_id + 1) * dim];
-            reordered.extend(v.iter().zip(c).map(|(&vi, &ci)| vi - ci));
-        } else {
-            reordered.extend_from_slice(v);
-        }
-    }
-
-    let reordered_dataset = DensePlain::from_raw(
-        reordered.into_boxed_slice(),
-        n,
-        ScalarDenseQuantizer::new(dim),
-    );
-
-    DenseBuildArtifacts {
-        centroids_f32: centroids,
-        reordered_dataset,
+    BuildArtifacts {
+        centroids,
         cluster_offsets: cluster_offsets.into_boxed_slice(),
         external_ids: order.into_boxed_slice(),
     }
 }
 
-/// f32 dot-product cluster storage — the canonical L2 IVF stores `v` (or `r`)
-/// here and reports squared-Euclidean via the correction terms.
-pub type DensePlainDP = PlainDenseDataset<f32, DotProduct>;
-
-// ---------------------------------------------------------------------------
-// Cluster encoders + L2 correction (shared by the binaries and the Index impls)
-// ---------------------------------------------------------------------------
-
-/// Reinterpret the reordered f32 values as `V`-precision dot-product plain storage.
-pub fn plain_dp_cluster<V>(artifacts: &DenseBuildArtifacts) -> PlainDenseDataset<V, DotProduct>
+/// k-means on `training`, with flat or HNSW centroid assignment.
+fn train_centroids<T, G>(
+    kmeans: &KMeans,
+    training: &T,
+    n_clusters: usize,
+    centroid_encoder: G::Encoder,
+    kmeans_hnsw: bool,
+    refine: impl Fn(&[u32], &mut T::Vector) + Sync,
+) -> G::Owned
 where
-    V: Float + FromF32 + ValueType,
-    PlainDenseDataset<V, DotProduct>: Dataset,
+    T: MeanDataset + Sync,
+    G: DatasetGrowable + Clone + Sync + Into<G::Owned>,
+    G::Owned: Sync + SpaceUsage,
+    G::Encoder: VectorEncoder<QueryParams = ()>,
+    <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
+    for<'a> <G::Encoder as VectorEncoder>::InputVector<'a>: From<&'a T::Vector>,
+    for<'a> <G::Encoder as VectorEncoder>::QueryVector<'a>: From<&'a T::Vector>,
 {
-    let n = artifacts.reordered_dataset.len();
-    let dim = artifacts.reordered_dataset.input_dim();
-    let vals: Vec<V> = artifacts
-        .reordered_dataset
-        .values()
-        .iter()
-        .map(|&v| V::from_f32_saturating(v))
-        .collect();
-    PlainDenseDataset::<V, DotProduct>::from_raw(
-        vals.into_boxed_slice(),
-        n,
-        ScalarDenseQuantizer::new(dim),
-    )
+    let centroids: G = if kmeans_hnsw {
+        let build_cfg = kmeans_hnsw_build_config();
+        kmeans.train_with_index_refined(
+            training,
+            n_clusters,
+            None,
+            centroid_encoder,
+            |centroids: G| HNSW::<G::Owned, Graph>::build_index(centroids.into(), &build_cfg),
+            &kmeans_hnsw_search_config(),
+            refine,
+        )
+    } else {
+        kmeans.train_refined(training, n_clusters, None, centroid_encoder, refine)
+    };
+    centroids.into()
 }
 
-/// Encode the reordered f32 values as `M`-subspace dot-product PQ storage.
-pub fn pq_dp_cluster<const M: usize>(
-    artifacts: &DenseBuildArtifacts,
-) -> DenseDataset<ProductQuantizer<M, DotProduct>>
-where
-    DenseDataset<ProductQuantizer<M, DotProduct>>:
-        Dataset<Encoder = ProductQuantizer<M, DotProduct>>,
-    for<'a> DenseDataset<ProductQuantizer<M, DotProduct>>:
-        ConvertFrom<&'a PlainDenseDataset<f32, DotProduct>, Config = ()>,
-    ProductQuantizer<M, DotProduct>: DenseVectorEncoder<InputValueType = f32, OutputValueType = u8>,
-{
-    let n = artifacts.reordered_dataset.len();
-    let dim = artifacts.reordered_dataset.input_dim();
-    let raw_dp = PlainDenseDataset::<f32, DotProduct>::from_raw(
-        artifacts
-            .reordered_dataset
-            .values()
-            .to_vec()
-            .into_boxed_slice(),
-        n,
-        ScalarDenseQuantizer::new(dim),
-    );
-    ConvertFrom::convert_from(&raw_dp, ())
-}
-
-/// Per-vector L2 correction from the *stored* (reconstructed) cluster vector ŵ:
-/// `‖ŵ‖²` for plain, `‖ŵ‖² + 2⟨c, ŵ⟩` for residual. Computing it from the stored
-/// reconstruction (not the exact f32 input) keeps the reported score exactly
-/// `‖q − (c + ŵ)‖²` for f16 / PQ storage too.
+/// Encode the reordered f32 vectors `stored` (see [`IVFInput::storage`]) as cluster storage `D`
+/// under the encoder configuration `config` and, when the reported metric `M` needs one
+/// ([`ReportedMetric::USES_CORRECTION`]), compute the per-vector L2 correction.
 ///
-/// `centroids` **must already be at the centroid-index precision** (round to f16
-/// first if the centroid index stores f16), so the `2⟨c, ŵ⟩` term matches the
-/// `‖q − c‖²` the search reads from the centroid index.
-pub fn l2_correction<D>(
+/// `query_params` are the cluster encoder's query parameters used to compute the correction
+/// (see [`l2_correction`]). `centroids` **must be at the centroid-index precision** (e.g. the
+/// f16 centroid dataset itself), so the correction's centroid terms match the `‖q − c‖²` the
+/// search reads from the centroid index.
+pub fn encode_clusters<M, S, D, Cfg, C>(
+    stored: &S,
+    config: Cfg,
+    query_params: &<D::Encoder as VectorEncoder>::QueryParams,
+    centroids: &C,
+    offsets: &[u32],
+    residual: bool,
+) -> (D, Option<Box<[f32]>>)
+where
+    M: ReportedMetric,
+    S: Dataset,
+    D: Dataset + for<'a> ConvertFrom<&'a S, Config = Cfg>,
+    D::Encoder: WithDistance<SquaredEuclideanDistance>,
+    C: MeanDataset,
+    for<'a> <D::Encoder as VectorEncoder>::QueryVector<'a>: From<&'a C::Vector>,
+{
+    let cluster = D::convert_from(stored, config);
+    let correction = M::USES_CORRECTION
+        .then(|| l2_correction(&cluster, query_params, centroids, offsets, residual));
+    (cluster, correction)
+}
+
+/// Per-vector L2 correction `‖c + w‖² − ‖c‖² = ‖w‖² + 2⟨c, w⟩` for each stored vector `w`
+/// (`c = 0` for plain storage), so the reported score `‖q − c‖² + correction − 2⟨q, w⟩` is
+/// `‖q − (c + w)‖²`.
+///
+/// `‖c + w‖²` is the cluster encoder's own L2 distance between the query `−c` and the stored
+/// `w` (via [`WithDistance`]), so it refers to the same `w` the dot-product scan scores: the
+/// reconstruction for scalar / PQ storage (where the result is exact), the encoder's estimate
+/// for estimators such as RaBitQ (where the code errors of the two terms cancel).
+fn l2_correction<D, C>(
     cluster: &D,
-    centroids: &[f32],
+    query_params: &<D::Encoder as VectorEncoder>::QueryParams,
+    centroids: &C,
     offsets: &[u32],
     residual: bool,
 ) -> Box<[f32]>
 where
     D: Dataset,
-    D::Encoder: DenseVectorEncoder,
+    D::Encoder: WithDistance<SquaredEuclideanDistance>,
+    C: MeanDataset,
+    for<'a> <D::Encoder as VectorEncoder>::QueryVector<'a>: From<&'a C::Vector>,
 {
-    let dim = cluster.input_dim();
+    let l2 = WithDistance::<SquaredEuclideanDistance>::with_distance(cluster.encoder());
     let n_clusters = offsets.len() - 1;
     let mut corr = vec![0.0f32; cluster.len()].into_boxed_slice();
     for cid in 0..n_clusters {
-        let c = &centroids[cid * dim..(cid + 1) * dim];
+        // The query −c (or 0 for plain storage), built from the centroid's own values.
+        let mut neg_c = centroids.vector(cid as u32);
+        let values = neg_c.as_mut();
+        let c_norm: f32 = if residual {
+            values.iter().map(|&x| x * x).sum()
+        } else {
+            0.0
+        };
+        for x in values.iter_mut() {
+            *x = if residual { -*x } else { 0.0 };
+        }
+        let evaluator = l2.query_evaluator((&neg_c).into(), query_params);
         for pos in offsets[cid] as usize..offsets[cid + 1] as usize {
-            let w = cluster.encoder().decode_vector(cluster.get(pos as u64));
-            corr[pos] = c
-                .iter()
-                .zip(w.values())
-                .map(|(&cj, &wj)| wj * wj + if residual { 2.0 * cj * wj } else { 0.0 })
-                .sum();
+            corr[pos] = evaluator
+                .compute_distance(cluster.get(pos as VectorId))
+                .distance()
+                - c_norm;
         }
     }
     corr
@@ -616,7 +639,7 @@ where
 
 /// Build parameters for [`IVF::build_index`]. The centroid index itself is
 /// supplied separately, via a `centroid_index_builder` closure passed to
-/// `build_index` — see [`IVF`]'s inherent `build_index` impls.
+/// `build_index` — see [`IVF::build_index`].
 ///
 /// Carries the k-means configuration (rebuilt into a [`KMeansBuilder`] at build
 /// time so `build_index` can take `&self`) plus whether to store residuals.
@@ -628,91 +651,6 @@ pub struct IVFBuildParams {
     pub kmeans_spherical: bool,
     /// Store residuals `r = v − c` (`true`) or original vectors (`false`).
     pub residual: bool,
-}
-
-/// Run k-means + reorder for a `build_index`, from an f32 (SE-typed) input dataset.
-fn prepare_ivf(input: &DensePlain, p: &IVFBuildParams) -> DenseBuildArtifacts {
-    let kmeans = KMeansBuilder::new()
-        .n_iter(p.kmeans_n_iter)
-        .n_redo(p.kmeans_n_redo)
-        .seed(p.kmeans_seed)
-        .spherical(p.kmeans_spherical);
-    prepare_dense_ivf(
-        input,
-        p.n_clusters,
-        kmeans,
-        p.residual,
-        None,
-        p.n_clusters >= KMEANS_HNSW_THRESHOLD,
-    )
-}
-
-/// Reinterpret f32 dot-product values as an f32 squared-Euclidean input for k-means.
-fn as_se_input(d: &DensePlainDP) -> DensePlain {
-    DensePlain::from_raw(
-        d.values().to_vec().into_boxed_slice(),
-        d.len(),
-        ScalarDenseQuantizer::new(d.input_dim()),
-    )
-}
-
-/// Assemble a **squared-Euclidean**-reporting IVF: L2 correction from the stored
-/// cluster, f32 centroids kept at SE.
-fn assemble_l2<D, CI>(
-    artifacts: DenseBuildArtifacts,
-    cluster: D,
-    centroid_index_builder: impl FnOnce(DensePlain) -> CI,
-    residual: bool,
-) -> IVF<DensePlain, D, CI>
-where
-    D: Dataset,
-    D::Encoder: DenseVectorEncoder,
-    CI: Index,
-    for<'q> CI: Index<Query<'q> = DenseVectorView<'q, f32>>,
-{
-    let correction = l2_correction(
-        &cluster,
-        artifacts.centroids_f32.values(),
-        &artifacts.cluster_offsets,
-        residual,
-    );
-    let ci = centroid_index_builder(artifacts.centroids_f32);
-    IVF::from_parts(
-        ci,
-        cluster,
-        artifacts.cluster_offsets,
-        artifacts.external_ids,
-        Some(correction),
-        residual,
-    )
-}
-
-/// Assemble a **dot-product**-reporting IVF: no correction, centroids reinterpreted as DP.
-fn assemble_ip<D, CI>(
-    artifacts: DenseBuildArtifacts,
-    cluster: D,
-    centroid_index_builder: impl FnOnce(DensePlainDP) -> CI,
-    residual: bool,
-) -> IVF<DensePlainDP, D, CI>
-where
-    D: Dataset,
-    CI: Index,
-    for<'q> CI: Index<Query<'q> = DenseVectorView<'q, f32>>,
-{
-    let centroids_dp = DensePlainDP::from_raw(
-        artifacts.centroids_f32.values().to_vec().into_boxed_slice(),
-        artifacts.centroids_f32.len(),
-        ScalarDenseQuantizer::new(artifacts.centroids_f32.input_dim()),
-    );
-    let ci = centroid_index_builder(centroids_dp);
-    IVF::from_parts(
-        ci,
-        cluster,
-        artifacts.cluster_offsets,
-        artifacts.external_ids,
-        None,
-        residual,
-    )
 }
 
 impl<DQ, D, CI> vectorium::IndexStats for IVF<DQ, D, CI>
@@ -763,127 +701,84 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// build_index: one impl, dispatched over two independent axes
-// ---------------------------------------------------------------------------
-//
-// `build_index` is always the same three steps — prepare (k-means), encode
-// (cluster storage), assemble (final index) — regardless of which reported
-// metric or cluster storage is used. [`BuildMetric`] and [`ClusterEncoding`]
-// each capture one axis, implemented once per concrete option; `build_index`
-// itself is written once, generic over both.
-
-/// The reported-metric axis: how a query/centroid dataset `DQ` maps onto
-/// build-time k-means, which internally is always f32/L2. One impl each for
-/// [`DensePlain`] (metric = SE, no transform needed) and [`DensePlainDP`]
-/// (metric = dot product, reinterpreted to/from SE via [`as_se_input`]).
-pub(crate) trait BuildMetric: Dataset + Sized {
-    /// Run k-means + reorder, converting to k-means' native f32/L2 shape first if needed.
-    fn prepare(&self, p: &IVFBuildParams) -> DenseBuildArtifacts;
-
-    /// Assemble the final IVF, given the already-encoded cluster storage and
-    /// a way to build the centroid index from the post-k-means centroids.
-    fn assemble<D, CI>(
-        artifacts: DenseBuildArtifacts,
-        cluster: D,
-        centroid_index_builder: impl FnOnce(Self) -> CI,
-        residual: bool,
-    ) -> IVF<Self, D, CI>
-    where
-        D: Dataset,
-        D::Encoder: DenseVectorEncoder,
-        CI: Index,
-        for<'q> CI: Index<Query<'q> = DenseVectorView<'q, f32>>;
-}
-
-impl BuildMetric for DensePlain {
-    fn prepare(&self, p: &IVFBuildParams) -> DenseBuildArtifacts {
-        prepare_ivf(self, p)
-    }
-
-    fn assemble<D, CI>(
-        artifacts: DenseBuildArtifacts,
-        cluster: D,
-        centroid_index_builder: impl FnOnce(Self) -> CI,
-        residual: bool,
-    ) -> IVF<Self, D, CI>
-    where
-        D: Dataset,
-        D::Encoder: DenseVectorEncoder,
-        CI: Index,
-        for<'q> CI: Index<Query<'q> = DenseVectorView<'q, f32>>,
-    {
-        assemble_l2(artifacts, cluster, centroid_index_builder, residual)
-    }
-}
-
-impl BuildMetric for DensePlainDP {
-    fn prepare(&self, p: &IVFBuildParams) -> DenseBuildArtifacts {
-        prepare_ivf(&as_se_input(self), p)
-    }
-
-    fn assemble<D, CI>(
-        artifacts: DenseBuildArtifacts,
-        cluster: D,
-        centroid_index_builder: impl FnOnce(Self) -> CI,
-        residual: bool,
-    ) -> IVF<Self, D, CI>
-    where
-        D: Dataset,
-        D::Encoder: DenseVectorEncoder,
-        CI: Index,
-        for<'q> CI: Index<Query<'q> = DenseVectorView<'q, f32>>,
-    {
-        assemble_ip(artifacts, cluster, centroid_index_builder, residual)
-    }
-}
-
-/// The cluster-storage axis: how k-means artifacts become the vectors an IVF
-/// actually scans. One impl each for plain `V`-precision storage and
-/// `M`-subspace PQ storage.
-pub(crate) trait ClusterEncoding: Dataset {
-    fn encode(artifacts: &DenseBuildArtifacts) -> Self;
-}
-
-impl<V: Float + FromF32 + ValueType> ClusterEncoding for PlainDenseDataset<V, DotProduct> {
-    fn encode(artifacts: &DenseBuildArtifacts) -> Self {
-        plain_dp_cluster::<V>(artifacts)
-    }
-}
-
-impl<const M: usize> ClusterEncoding for DenseDataset<ProductQuantizer<M, DotProduct>>
-where
-    DenseDataset<ProductQuantizer<M, DotProduct>>:
-        Dataset<Encoder = ProductQuantizer<M, DotProduct>>,
-    for<'a> DenseDataset<ProductQuantizer<M, DotProduct>>:
-        ConvertFrom<&'a PlainDenseDataset<f32, DotProduct>, Config = ()>,
-{
-    fn encode(artifacts: &DenseBuildArtifacts) -> Self {
-        pq_dp_cluster::<M>(artifacts)
-    }
-}
-
-// `BuildMetric`/`ClusterEncoding` are deliberately `pub(crate)`, sealing which
-// `DQ`/`D` combinations `build_index` accepts to the ones implemented above.
-#[allow(private_bounds)]
 impl<DQ, D, CI> IVF<DQ, D, CI>
 where
-    DQ: BuildMetric,
-    D: ClusterEncoding,
-    D::Encoder: DenseVectorEncoder,
+    DQ: MeanDataset + Sync,
+    <DQ::Encoder as VectorEncoder>::Distance: ReportedMetric,
+    D: Dataset,
     CI: Index,
-    for<'q> CI: Index<Query<'q> = DenseVectorView<'q, f32>>,
 {
-    /// Build an IVF. `centroid_index_builder` builds the centroid index from the
-    /// post-k-means centroids — how it does so is entirely up to the caller.
-    pub fn build_index(
+    /// Build an IVF.
+    ///
+    /// - `centroid_encoder` builds the k-means centroids `G`; its metric is the clustering
+    ///   metric (dense IVF usually clusters under squared Euclidean whatever it reports).
+    /// - Clusters are stored by encoding `S`, the reordered vectors (or residuals) as an f32
+    ///   dot-product dataset, with `cluster_config` (`()` for scalar and PQ storage, e.g. a
+    ///   `RabitqConfig` for RaBitQ). `cluster_query_params` are the storage encoder's query
+    ///   parameters for computing the L2 correction (see [`encode_clusters`]).
+    /// - `centroid_index_builder` builds the centroid index from the post-k-means centroids,
+    ///   relabelled to `DQ` — how it does so is entirely up to the caller.
+    ///
+    /// For control over sampling or centroid refinement, use [`prepare_ivf`],
+    /// [`encode_clusters`] and [`IVF::from_parts`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_index<G, S, Cfg>(
         dataset: DQ,
         p: &IVFBuildParams,
+        centroid_encoder: G::Encoder,
+        cluster_config: Cfg,
+        cluster_query_params: &<D::Encoder as VectorEncoder>::QueryParams,
         centroid_index_builder: impl FnOnce(DQ) -> CI,
-    ) -> Self {
-        let artifacts = dataset.prepare(p);
-        let cluster = D::encode(&artifacts);
-        DQ::assemble(artifacts, cluster, centroid_index_builder, p.residual)
+    ) -> Self
+    where
+        G: DatasetGrowable + MeanDataset<Vector = DQ::Vector> + Clone + Sync + Into<G::Owned>,
+        G::Owned: MeanDataset<Vector = DQ::Vector> + Clone + Sync + SpaceUsage + Into<DQ> + Into<S>,
+        G::Encoder: VectorEncoder<QueryParams = ()> + Clone,
+        <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
+        for<'a> <G::Encoder as VectorEncoder>::InputVector<'a>: From<&'a DQ::Vector>,
+        for<'a> <G::Encoder as VectorEncoder>::QueryVector<'a>: From<&'a DQ::Vector>,
+        DQ::Owned: Into<S>,
+        S: Dataset,
+        D: for<'a> ConvertFrom<&'a S, Config = Cfg>,
+        D::Encoder: WithDistance<SquaredEuclideanDistance>,
+        for<'a> <D::Encoder as VectorEncoder>::QueryVector<'a>: From<&'a DQ::Vector>,
+    {
+        let kmeans = KMeansBuilder::new()
+            .n_iter(p.kmeans_n_iter)
+            .n_redo(p.kmeans_n_redo)
+            .seed(p.kmeans_seed)
+            .spherical(p.kmeans_spherical);
+        let a = prepare_ivf::<DQ, G>(
+            &dataset,
+            p.n_clusters,
+            kmeans,
+            centroid_encoder.clone(),
+            None,
+            p.n_clusters >= KMEANS_HNSW_THRESHOLD,
+            |_, _| {},
+        );
+        let stored: S = if p.residual {
+            a.residuals::<DQ, G>(&dataset, centroid_encoder).into()
+        } else {
+            a.reorder(&dataset).into()
+        };
+        let (cluster, correction) = encode_clusters::<Reported<DQ>, _, D, _, _>(
+            &stored,
+            cluster_config,
+            cluster_query_params,
+            &a.centroids,
+            &a.cluster_offsets,
+            p.residual,
+        );
+        drop(stored);
+        IVF::from_parts(
+            centroid_index_builder(a.centroids.into()),
+            cluster,
+            a.cluster_offsets,
+            a.external_ids,
+            correction,
+            p.residual,
+        )
     }
 }
 
@@ -894,6 +789,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use vectorium::{
+        PlainDenseDataset, PlainDenseDatasetGrowable, PlainSparseDataset,
+        PlainSparseDatasetGrowable, PlainSparseQuantizer, ScalarDenseDataset, ScalarDenseQuantizer,
+        ScalarSparseDataset,
+    };
+
+    type DensePlain = PlainDenseDataset<f32, SquaredEuclideanDistance>;
+    type DensePlainDP = PlainDenseDataset<f32, DotProduct>;
+    type SparsePlainDP<C> = PlainSparseDataset<C, f32, DotProduct>;
+    /// k-means centroids: dense data clusters under squared Euclidean, sparse under dot product.
+    type DenseCentroids = PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance>;
+    type SparseCentroids = PlainSparseDatasetGrowable<u16, f32, DotProduct>;
 
     // Sign / formula checks for the reported-metric reconstruction. The cluster
     // dataset always yields a raw dot product `raw = ⟨q,w⟩`.
@@ -958,7 +866,14 @@ mod tests {
                 kmeans_spherical: false,
                 residual,
             };
-            let index = Ivf::build_index(dataset.clone(), &params, FlatIndex::from);
+            let index = Ivf::build_index::<DenseCentroids, DensePlainDP, _>(
+                dataset.clone(),
+                &params,
+                ScalarDenseQuantizer::new(dim),
+                (),
+                &(),
+                FlatIndex::from,
+            );
 
             assert_eq!(IndexStats::n_elements(&index), 6);
             assert_eq!(IndexStats::dim(&index), 2);
@@ -1013,8 +928,16 @@ mod tests {
         };
 
         // (a) f16 cluster storage, L2 metric.
-        type IvfF16 = IVF<DensePlain, PlainDenseDataset<f16, DotProduct>, FlatIndex<DensePlain>>;
-        let idx = IvfF16::build_index(dataset.clone(), &params, FlatIndex::from);
+        type IvfF16 =
+            IVF<DensePlain, ScalarDenseDataset<f32, f16, DotProduct>, FlatIndex<DensePlain>>;
+        let idx = IvfF16::build_index::<DenseCentroids, DensePlainDP, _>(
+            dataset.clone(),
+            &params,
+            ScalarDenseQuantizer::new(dim),
+            (),
+            &(),
+            FlatIndex::from,
+        );
         let sp = IVFSearchParams {
             nprobe: 2,
             centroid_search_params: (),
@@ -1030,7 +953,14 @@ mod tests {
             dataset.len(),
             ScalarDenseQuantizer::new(dim),
         );
-        let idx = IvfDp::build_index(ds_dp, &params, FlatIndex::from);
+        let idx = IvfDp::build_index::<DenseCentroids, DensePlainDP, _>(
+            ds_dp,
+            &params,
+            ScalarDenseQuantizer::new(dim),
+            (),
+            &(),
+            FlatIndex::from,
+        );
         let sp = IVFSearchParams {
             nprobe: 2,
             centroid_search_params: (),
@@ -1039,5 +969,439 @@ mod tests {
         let res = <IvfDp as Index>::search(&idx, DenseVectorView::new(&[10.05f32, 10.0]), 1, &sp);
         // Max ⟨q, v⟩ is id 5 = (9.9, 10.2): 10.05·9.9 + 10·10.2 = 201.5.
         assert_eq!(res[0].vector, 5);
+    }
+
+    /// Gaussian blobs in `dim` dimensions (RaBitQ needs `dim` to be a multiple of 64).
+    fn random_dense(n: usize, dim: usize, seed: u64) -> DensePlain {
+        use rand::Rng;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..dim).map(|_| rng.gen_range(-5.0f32..5.0)).collect())
+            .collect();
+        let mut g = PlainDenseDatasetGrowable::<f32, SquaredEuclideanDistance>::new(
+            ScalarDenseQuantizer::new(dim),
+        );
+        for i in 0..n {
+            let v: Vec<f32> = centers[i % 8]
+                .iter()
+                .map(|&c| c + rng.gen_range(-1.0f32..1.0))
+                .collect();
+            g.push(vectorium::DenseVectorView::new(&v));
+        }
+        g.into()
+    }
+
+    fn dense_params(residual: bool) -> IVFBuildParams {
+        IVFBuildParams {
+            n_clusters: 8,
+            kmeans_n_iter: 10,
+            kmeans_n_redo: 1,
+            kmeans_seed: Some(42),
+            kmeans_spherical: false,
+            residual,
+        }
+    }
+
+    /// RaBitQ cluster storage under dot product: a full probe returns the top-k of a `FlatIndex`
+    /// over RaBitQ codes of the same data (plain storage needs no correction). Scores match up
+    /// to rounding only: RaBitQ trains its centering mean on the reordered vectors, which sums
+    /// them in a different order.
+    #[test]
+    fn rabitq_ivf_dot_product_full_probe_matches_flat_index() {
+        use vectorium::{FlatIndex, RabitqConfig, RabitqQuantizer, RabitqQueryParams};
+
+        let dim = 128;
+        let data: DensePlainDP = random_dense(2000, dim, 1).into();
+        let queries = random_dense(20, dim, 2);
+        type Cluster = vectorium::DenseDataset<RabitqQuantizer<DotProduct>>;
+        type Ivf = IVF<DensePlainDP, Cluster, FlatIndex<DensePlainDP>>;
+        let config = RabitqConfig::default();
+        let qp = RabitqQueryParams { query_bits: 4 };
+        let ivf = Ivf::build_index::<DenseCentroids, DensePlainDP, _>(
+            data.clone(),
+            &dense_params(false),
+            ScalarDenseQuantizer::new(dim),
+            config,
+            &qp,
+            FlatIndex::from,
+        );
+        let flat = FlatIndex::from(<Cluster as ConvertFrom<_>>::convert_from(&data, config));
+        let sp = IVFSearchParams {
+            nprobe: 8,
+            centroid_search_params: (),
+            cluster_query_params: qp,
+        };
+        for q in queries.iter() {
+            let got = Index::search(&ivf, q, 10, &sp);
+            let want = flat.search(q, 10, &qp);
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(g.vector, w.vector);
+                let (g, w) = (g.distance.distance(), w.distance.distance());
+                assert!((g - w).abs() <= 1e-5 * w.abs(), "{g} vs {w}");
+            }
+        }
+    }
+
+    /// RaBitQ-ext scores an unquantized query, so its estimate is linear in the query and the
+    /// decomposition is an identity: plain L2 scores plus the dropped `‖q‖²` equal RaBitQ-ext's
+    /// own L2 estimate, up to rounding.
+    #[test]
+    fn rabitq_ext_ivf_euclidean_equals_native_estimate() {
+        use vectorium::{FlatIndex, RabitqExtConfig, RabitqExtQuantizer};
+
+        let dim = 128;
+        let data = random_dense(2000, dim, 5);
+        let queries = random_dense(20, dim, 6);
+        type Cluster = vectorium::DenseDataset<RabitqExtQuantizer<DotProduct>>;
+        type Native = vectorium::DenseDataset<RabitqExtQuantizer<SquaredEuclideanDistance>>;
+        type Ivf = IVF<DensePlain, Cluster, FlatIndex<DensePlain>>;
+        let config = RabitqExtConfig::default();
+        let ivf = Ivf::build_index::<DenseCentroids, DensePlainDP, _>(
+            data.clone(),
+            &dense_params(false),
+            ScalarDenseQuantizer::new(dim),
+            config,
+            &(),
+            FlatIndex::from,
+        );
+        let native = FlatIndex::from(<Native as ConvertFrom<_>>::convert_from(&data, config));
+        let sp = IVFSearchParams {
+            nprobe: 8,
+            centroid_search_params: (),
+            cluster_query_params: (),
+        };
+        for q in queries.iter() {
+            let q_norm: f32 = q.values().iter().map(|x| x * x).sum();
+            let got = Index::search(&ivf, q, 10, &sp);
+            let want = native.search(q, 10, &());
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(g.vector, w.vector);
+                let (g, w) = (g.distance.distance() + q_norm, w.distance.distance());
+                assert!((g - w).abs() <= 1e-4 * w.abs(), "{g} vs {w}");
+            }
+        }
+    }
+
+    /// The L2 correction comes from the encoder's own L2 estimate, so its code errors cancel
+    /// with the dot-product scan's. With an 8-bit RaBitQ-ext storage, a full probe must then
+    /// recover nearly the exact L2 top-10, plain and residual.
+    #[test]
+    fn rabitq_ivf_euclidean_full_probe_recovers_exact_neighbors() {
+        use vectorium::{FlatIndex, RabitqExtConfig, RabitqExtQuantizer};
+
+        let dim = 128;
+        let data = random_dense(2000, dim, 3);
+        let queries = random_dense(20, dim, 4);
+        let exact = FlatIndex::from(data.clone());
+        type Cluster = vectorium::DenseDataset<RabitqExtQuantizer<DotProduct>>;
+        type Ivf = IVF<DensePlain, Cluster, FlatIndex<DensePlain>>;
+        let config = RabitqExtConfig {
+            total_bits: 8,
+            ..RabitqExtConfig::default()
+        };
+        for residual in [false, true] {
+            let ivf = Ivf::build_index::<DenseCentroids, DensePlainDP, _>(
+                data.clone(),
+                &dense_params(residual),
+                ScalarDenseQuantizer::new(dim),
+                config,
+                &(),
+                FlatIndex::from,
+            );
+            let sp = IVFSearchParams {
+                nprobe: 8,
+                centroid_search_params: (),
+                cluster_query_params: (),
+            };
+            let mut hits = 0;
+            for q in queries.iter() {
+                let want: std::collections::HashSet<_> =
+                    exact.search(q, 10, &()).iter().map(|r| r.vector).collect();
+                hits += Index::search(&ivf, q, 10, &sp)
+                    .iter()
+                    .filter(|r| want.contains(&r.vector))
+                    .count();
+            }
+            let recall = hits as f32 / (10 * queries.len()) as f32;
+            assert!(recall >= 0.9, "residual={residual}: recall@10 {recall}");
+        }
+    }
+
+    /// Random SPLADE-like sparse data: `n` vectors over `dim` terms, positive values.
+    fn random_sparse(n: usize, dim: usize, seed: u64) -> SparsePlainDP<u16> {
+        use rand::Rng;
+        use vectorium::PlainSparseQuantizer;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut g = PlainSparseDatasetGrowable::<u16, f32, DotProduct>::new(
+            PlainSparseQuantizer::new(dim, dim),
+        );
+        for _ in 0..n {
+            let mut comps: Vec<u16> = (0..30).map(|_| rng.gen_range(0..dim as u16)).collect();
+            comps.sort_unstable();
+            comps.dedup();
+            let vals: Vec<f32> = comps.iter().map(|_| rng.gen_range(0.01f32..3.0)).collect();
+            g.push(vectorium::SparseVectorView::new(&comps, &vals));
+        }
+        g.into()
+    }
+
+    fn sparse_params(n_clusters: usize, residual: bool) -> IVFBuildParams {
+        IVFBuildParams {
+            n_clusters,
+            kmeans_n_iter: 10,
+            kmeans_n_redo: 1,
+            kmeans_seed: Some(42),
+            kmeans_spherical: false,
+            residual,
+        }
+    }
+
+    /// Same IDs in the same order, scores equal up to rounding: the IVF scans clusters with the
+    /// batched kernel, the flat index one vector at a time, and without FMA the two can differ
+    /// in the last bits.
+    fn assert_same_top_k(got: &[ScoredVector<DotProduct>], want: &[ScoredVector<DotProduct>]) {
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want) {
+            assert_eq!(g.vector, w.vector);
+            let (g, w) = (g.distance.distance(), w.distance.distance());
+            assert!((g - w).abs() <= 1e-5 * w.abs(), "{g} vs {w}");
+        }
+    }
+
+    /// With `nprobe` = number of clusters, sparse IVF scans every vector and must return
+    /// the top-k of a `FlatIndex` over the same data: same IDs, same scores up to rounding.
+    #[test]
+    fn sparse_ivf_full_probe_matches_flat_index() {
+        use vectorium::FlatIndex;
+
+        let dim = 1000;
+        let data = random_sparse(3000, dim, 1);
+        let queries = random_sparse(50, dim, 2);
+        let n_clusters = 16;
+
+        type SparseIvf = IVF<SparsePlainDP<u16>, SparsePlainDP<u16>, FlatIndex<SparsePlainDP<u16>>>;
+        let ivf = SparseIvf::build_index::<SparseCentroids, SparsePlainDP<u16>, _>(
+            data.clone(),
+            &sparse_params(n_clusters, false),
+            PlainSparseQuantizer::new(dim, dim),
+            (),
+            &(),
+            FlatIndex::from,
+        );
+        assert_eq!(ivf.n_clusters(), n_clusters);
+        assert_eq!(ivf.n_elements(), data.len());
+        let flat = FlatIndex::from(data);
+
+        let sp = IVFSearchParams {
+            nprobe: n_clusters,
+            centroid_search_params: (),
+            cluster_query_params: (),
+        };
+        for q in queries.iter() {
+            let got = <SparseIvf as Index>::search(&ivf, q, 10, &sp);
+            assert_same_top_k(&got, &flat.search(q, 10, &()));
+        }
+    }
+
+    /// Same check through an f16 cluster storage, against a `FlatIndex` over f16 data.
+    #[test]
+    fn sparse_ivf_f16_full_probe_matches_flat_index() {
+        use vectorium::FlatIndex;
+        use vectorium::core::dataset::ConvertFrom;
+
+        let dim = 500;
+        let data = random_sparse(1000, dim, 3);
+        let queries = random_sparse(20, dim, 4);
+        let n_clusters = 8;
+
+        type Cluster16 = ScalarSparseDataset<u16, f32, half::f16, DotProduct>;
+        type SparseIvf16 = IVF<SparsePlainDP<u16>, Cluster16, FlatIndex<SparsePlainDP<u16>>>;
+        let ivf = SparseIvf16::build_index::<SparseCentroids, SparsePlainDP<u16>, _>(
+            data.clone(),
+            &sparse_params(n_clusters, false),
+            PlainSparseQuantizer::new(dim, dim),
+            (),
+            &(),
+            FlatIndex::from,
+        );
+        let flat = FlatIndex::from(<Cluster16 as ConvertFrom<_>>::convert_from(&data, ()));
+
+        let sp = IVFSearchParams {
+            nprobe: n_clusters,
+            centroid_search_params: (),
+            cluster_query_params: (),
+        };
+        for q in queries.iter() {
+            assert_eq!(
+                <SparseIvf16 as Index>::search(&ivf, q, 10, &sp),
+                flat.search(q, 10, &())
+            );
+        }
+    }
+
+    /// Clustering metric is independent of the reported one: cluster under squared Euclidean,
+    /// route and score under dot product; a full probe still equals the flat top-k.
+    #[test]
+    fn sparse_ivf_euclidean_clustering_full_probe_matches_flat_index() {
+        use vectorium::FlatIndex;
+
+        let dim = 500;
+        let data = random_sparse(1000, dim, 6);
+        let queries = random_sparse(20, dim, 7);
+        let n_clusters = 8;
+
+        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42));
+        let a = prepare_ivf::<_, PlainSparseDatasetGrowable<u16, f32, SquaredEuclideanDistance>>(
+            &data,
+            n_clusters,
+            kmeans,
+            PlainSparseQuantizer::new(dim, dim),
+            None,
+            false,
+            |_, _| {},
+        );
+        let cluster = a.reorder(&data);
+        let ivf: IVF<SparsePlainDP<u16>, SparsePlainDP<u16>, FlatIndex<SparsePlainDP<u16>>> =
+            IVF::from_parts(
+                FlatIndex::from(SparsePlainDP::<u16>::from(a.centroids)),
+                cluster,
+                a.cluster_offsets,
+                a.external_ids,
+                None,
+                false,
+            );
+        let flat = FlatIndex::from(data);
+        let sp = IVFSearchParams {
+            nprobe: n_clusters,
+            centroid_search_params: (),
+            cluster_query_params: (),
+        };
+        for q in queries.iter() {
+            assert_same_top_k(&Index::search(&ivf, q, 10, &sp), &flat.search(q, 10, &()));
+        }
+    }
+
+    /// Pruned centroids change which cluster a vector lands in, never what a full probe returns.
+    #[test]
+    fn sparse_ivf_pruned_centroids_full_probe_matches_flat_index() {
+        use vectorium::FlatIndex;
+
+        let dim = 500;
+        let data = random_sparse(1000, dim, 8);
+        let queries = random_sparse(20, dim, 9);
+        let n_clusters = 8;
+
+        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42));
+        let a = prepare_ivf::<_, PlainSparseDatasetGrowable<u16, f32, DotProduct>>(
+            &data,
+            n_clusters,
+            kmeans,
+            PlainSparseQuantizer::new(dim, dim),
+            None,
+            false,
+            vectorium::sparse_centroid_pruning(&data, 2.0),
+        );
+        // Each cluster's average nnz is at most 30 here, so no centroid may keep more than 60.
+        assert!(a.centroids.iter().all(|c| c.len() <= 60));
+        let cluster = a.reorder(&data);
+        let ivf: IVF<SparsePlainDP<u16>, SparsePlainDP<u16>, FlatIndex<SparsePlainDP<u16>>> =
+            IVF::from_parts(
+                FlatIndex::from(a.centroids),
+                cluster,
+                a.cluster_offsets,
+                a.external_ids,
+                None,
+                false,
+            );
+        let flat = FlatIndex::from(data);
+        let sp = IVFSearchParams {
+            nprobe: n_clusters,
+            centroid_search_params: (),
+            cluster_query_params: (),
+        };
+        for q in queries.iter() {
+            assert_same_top_k(&Index::search(&ivf, q, 10, &sp), &flat.search(q, 10, &()));
+        }
+    }
+
+    /// Same check with HNSW-assisted k-means and an HNSW centroid index: probing every cluster
+    /// with a beam that covers them all scans every vector, so the result equals the flat top-k.
+    #[test]
+    fn sparse_ivf_hnsw_centroids_full_probe_matches_flat_index() {
+        use vectorium::FlatIndex;
+
+        let dim = 500;
+        let data = random_sparse(1000, dim, 10);
+        let queries = random_sparse(20, dim, 11);
+        let n_clusters = 16;
+
+        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42));
+        let a = prepare_ivf::<_, PlainSparseDatasetGrowable<u16, f32, DotProduct>>(
+            &data,
+            n_clusters,
+            kmeans,
+            PlainSparseQuantizer::new(dim, dim),
+            None,
+            true,
+            vectorium::sparse_centroid_pruning(&data, 2.0),
+        );
+        let cluster = a.reorder(&data);
+        let centroid_index: HNSW<SparsePlainDP<u16>, Graph> =
+            HNSW::build_index(a.centroids, &HNSWBuildConfiguration::default());
+        let ivf: IVF<SparsePlainDP<u16>, SparsePlainDP<u16>, HNSW<SparsePlainDP<u16>, Graph>> =
+            IVF::from_parts(
+                centroid_index,
+                cluster,
+                a.cluster_offsets,
+                a.external_ids,
+                None,
+                false,
+            );
+        let flat = FlatIndex::from(data);
+        let sp = IVFSearchParams {
+            nprobe: n_clusters,
+            centroid_search_params: HNSWSearchConfiguration::default().with_ef_search(n_clusters),
+            cluster_query_params: (),
+        };
+        for q in queries.iter() {
+            assert_same_top_k(&Index::search(&ivf, q, 10, &sp), &flat.search(q, 10, &()));
+        }
+    }
+
+    /// Residuals are generic too: a sparse residual IVF (`⟨q,c⟩ + ⟨q,r⟩`) probed in full returns
+    /// the flat top-k, scores up to rounding.
+    #[test]
+    fn sparse_residual_ivf_full_probe_matches_flat_index() {
+        use vectorium::FlatIndex;
+
+        let dim = 500;
+        let data = random_sparse(1000, dim, 12);
+        let queries = random_sparse(20, dim, 13);
+        let n_clusters = 8;
+        type SparseIvf = IVF<SparsePlainDP<u16>, SparsePlainDP<u16>, FlatIndex<SparsePlainDP<u16>>>;
+        let ivf = SparseIvf::build_index::<SparseCentroids, SparsePlainDP<u16>, _>(
+            data.clone(),
+            &sparse_params(n_clusters, true),
+            PlainSparseQuantizer::new(dim, dim),
+            (),
+            &(),
+            FlatIndex::from,
+        );
+        assert!(ivf.is_residual());
+        let flat = FlatIndex::from(data);
+        let sp = IVFSearchParams {
+            nprobe: n_clusters,
+            centroid_search_params: (),
+            cluster_query_params: (),
+        };
+        for q in queries.iter() {
+            let got = Index::search(&ivf, q, 10, &sp);
+            let want = flat.search(q, 10, &());
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(g.vector, w.vector);
+                let (g, w) = (g.distance.distance(), w.distance.distance());
+                assert!((g - w).abs() <= 1e-4 * w.abs(), "{g} vs {w}");
+            }
+        }
     }
 }

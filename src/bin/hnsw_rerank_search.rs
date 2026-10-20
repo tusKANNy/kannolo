@@ -8,8 +8,8 @@ use std::fs::File;
 
 use kannolo::graph::Graph;
 use kannolo::hnsw::{EarlyTerminationStrategy, HNSW, HNSWSearchConfiguration};
+use kannolo::rerank_index::RerankIndex;
 use vectorium::IndexSerializer;
-use vectorium::core::rerank_index::RerankIndex;
 use vectorium::core::vector::DenseVectorView;
 use vectorium::distances::{Distance, DotProduct, SquaredEuclideanDistance};
 use vectorium::encoders::dense_scalar::ScalarDenseSupportedDistance;

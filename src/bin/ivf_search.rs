@@ -1,4 +1,4 @@
-/// Search an IVF index.
+/// Search an IVF index over dense (`.npy`) or sparse (Seismic binary format) vectors.
 use std::fs::File;
 use std::io::Write as IoWrite;
 use std::process;
@@ -9,21 +9,34 @@ use half::f16;
 
 use kannolo::graph::Graph;
 use kannolo::hnsw::{EarlyTerminationStrategy, HNSW, HNSWSearchConfiguration};
-use kannolo::ivf::{IVF, IVFSearchParams, ReportedMetric};
+use kannolo::ivf::{IVF, IVFSearchParams};
 use vectorium::IndexSerializer;
 use vectorium::core::index::Index;
-use vectorium::core::vector::DenseVectorView;
 use vectorium::distances::{DotProduct, SquaredEuclideanDistance};
 use vectorium::encoders::pq::ProductQuantizer;
-use vectorium::readers::read_npy_f32;
-use vectorium::vector_encoder::{DenseVectorEncoder, VectorEncoder};
-use vectorium::{Dataset, DenseDataset, Distance, FlatIndex, PlainDenseDataset, QueryEvaluator};
+use vectorium::readers::{read_npy_f32, read_seismic_format};
+use vectorium::vector_encoder::VectorEncoder;
+use vectorium::{
+    Dataset, DenseDataset, Distance, FlatIndex, PlainDenseDataset, RabitqExtQuantizer,
+    RabitqQuantizer, RabitqQueryParams, ScalarDenseDataset, ScalarSparseDataset, SpaceUsage,
+};
 
+/// Dense centroids are stored in f16, under the reported metric.
 #[allow(non_camel_case_types)]
-type DQ_SE = PlainDenseDataset<f16, SquaredEuclideanDistance>;
+type DQ_SE = ScalarDenseDataset<f32, f16, SquaredEuclideanDistance>;
 #[allow(non_camel_case_types)]
-type DQ_DP = PlainDenseDataset<f16, DotProduct>;
-type Queries = PlainDenseDataset<f32, SquaredEuclideanDistance>;
+type DQ_DP = ScalarDenseDataset<f32, f16, DotProduct>;
+type DenseQueries = PlainDenseDataset<f32, SquaredEuclideanDistance>;
+/// Sparse queries and centroids: f32, u16 components, dot product.
+type Sparse = vectorium::PlainSparseDataset<u16, f32, DotProduct>;
+type DensePlainDP = PlainDenseDataset<f32, DotProduct>;
+
+#[derive(Debug, Clone, ValueEnum, Default)]
+enum DatasetType {
+    #[default]
+    Dense,
+    Sparse,
+}
 
 #[derive(Debug, Clone, ValueEnum, Default)]
 enum ValueTypeArg {
@@ -32,9 +45,18 @@ enum ValueTypeArg {
     F16,
 }
 
-#[derive(Debug, Clone, ValueEnum, Default)]
-enum MetricArg {
+/// Cluster storage encoder. Dense: plain, pq (with --m-pq), rabitq, rabitq-ext. Sparse: plain.
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum EncoderType {
     #[default]
+    Plain,
+    Pq,
+    Rabitq,
+    RabitqExt,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum MetricArg {
     Euclidean,
     Dotproduct,
 }
@@ -48,18 +70,32 @@ struct Args {
     query_file: String,
     #[clap(short, long)]
     output_path: Option<String>,
+    /// Dense vectors (`.npy`) or sparse vectors (Seismic binary format).
+    #[clap(long, value_enum, default_value_t = DatasetType::Dense)]
+    dataset_type: DatasetType,
     #[clap(short, long, default_value_t = 10)]
     k: usize,
     #[clap(long, default_value_t = 32)]
     n_probe: usize,
-    #[clap(long, value_enum, default_value_t = MetricArg::Euclidean)]
-    distance: MetricArg,
+    /// Reported metric. Default: euclidean for dense, dotproduct for sparse (the only one
+    /// sparse IVF supports).
+    #[clap(long, value_enum)]
+    distance: Option<MetricArg>,
     #[clap(long, value_enum, default_value_t = ValueTypeArg::F32)]
     value_type: ValueTypeArg,
     #[clap(long, default_value_t = false)]
     hnsw: bool,
+    /// Cluster storage encoder, as built (dense only for anything but plain). `--m-pq` alone
+    /// implies pq.
+    #[clap(long, value_enum, default_value_t = EncoderType::Plain)]
+    encoder: EncoderType,
+    /// PQ subspaces (dense only).
     #[clap(long)]
     m_pq: Option<usize>,
+    /// Bits per component of the quantized query, 1..=8 (rabitq only). Use the value the
+    /// index was built with; 1 is only valid for plain dot-product indexes.
+    #[clap(long, default_value_t = 4)]
+    rabitq_query_bits: u32,
     #[clap(long, default_value_t = 40)]
     ef_search: usize,
     #[clap(long, default_value_t = 0.0)]
@@ -68,265 +104,186 @@ struct Args {
     num_runs: usize,
 }
 
+/// Dense: dispatch on the cluster storage. Residual-vs-plain is read from the index.
+macro_rules! dense {
+    ($dq:ty, $args:expr, $queries:expr) => {
+        match ($args.encoder, $args.m_pq, &$args.value_type) {
+            (EncoderType::Rabitq, _, _) => {
+                centroid_index::<$dq, DenseDataset<RabitqQuantizer<DotProduct>>, _>($args, $queries)
+            }
+            (EncoderType::RabitqExt, _, _) => {
+                centroid_index::<$dq, DenseDataset<RabitqExtQuantizer<DotProduct>>, _>(
+                    $args, $queries,
+                )
+            }
+            (_, None, ValueTypeArg::F32) => centroid_index::<$dq, DensePlainDP, _>($args, $queries),
+            (_, None, ValueTypeArg::F16) => {
+                centroid_index::<$dq, ScalarDenseDataset<f32, f16, DotProduct>, _>($args, $queries)
+            }
+            (_, Some(m), _) => dense!(@pq $dq, $args, $queries, m; 4, 8, 16, 32, 48, 64, 96, 128, 192),
+        }
+    };
+    (@pq $dq:ty, $args:expr, $queries:expr, $m:expr; $($pq:literal),*) => {
+        match $m {
+            $($pq => centroid_index::<$dq, DenseDataset<ProductQuantizer<$pq, DotProduct>>, _>(
+                $args, $queries,
+            ),)*
+            m => fail(&format!("unsupported --m-pq {m}")),
+        }
+    };
+}
+
+fn fail(msg: &str) -> ! {
+    eprintln!("Error: {msg}");
+    process::exit(1);
+}
+
 fn main() {
     let args = Args::parse();
-    let queries: Queries = read_npy_f32(&args.query_file).unwrap_or_else(|e| {
-        eprintln!("Error reading queries: {e:?}");
-        process::exit(1);
-    });
-    if args.m_pq.is_some() {
-        dispatch_pq(&args, &queries);
-    } else {
-        dispatch_plain(&args, &queries);
+    match (args.encoder, args.m_pq) {
+        (EncoderType::Pq, None) => fail("--encoder pq needs --m-pq."),
+        (EncoderType::Rabitq | EncoderType::RabitqExt, Some(_)) => {
+            fail("--m-pq is for --encoder pq only.")
+        }
+        _ => {}
     }
-}
-
-// ---------------------------------------------------------------------------
-// MakeParams: centroid metric matches DQ type
-// ---------------------------------------------------------------------------
-
-trait MakeParams<DQ: Dataset>: Index + Sized {
-    fn make_params(nprobe: usize, args: &Args) -> IVFSearchParams<Self>;
-}
-impl MakeParams<DQ_SE> for FlatIndex<DQ_SE> {
-    fn make_params(nprobe: usize, _args: &Args) -> IVFSearchParams<Self> {
-        IVFSearchParams {
-            nprobe,
-            centroid_search_params: (),
-            cluster_query_params: (),
-        }
-    }
-}
-impl MakeParams<DQ_SE> for HNSW<DQ_SE, Graph> {
-    fn make_params(nprobe: usize, args: &Args) -> IVFSearchParams<Self> {
-        let ef = args.ef_search.max(nprobe);
-        let cfg = HNSWSearchConfiguration::default()
-            .with_ef_search(ef)
-            .with_early_termination(if args.lambda > 0.0 {
-                EarlyTerminationStrategy::DistanceAdaptive {
-                    lambda: args.lambda,
-                }
-            } else {
-                EarlyTerminationStrategy::None
-            });
-        IVFSearchParams {
-            nprobe,
-            centroid_search_params: cfg,
-            cluster_query_params: (),
-        }
-    }
-}
-impl MakeParams<DQ_DP> for FlatIndex<DQ_DP> {
-    fn make_params(nprobe: usize, _args: &Args) -> IVFSearchParams<Self> {
-        IVFSearchParams {
-            nprobe,
-            centroid_search_params: (),
-            cluster_query_params: (),
-        }
-    }
-}
-impl MakeParams<DQ_DP> for HNSW<DQ_DP, Graph> {
-    fn make_params(nprobe: usize, args: &Args) -> IVFSearchParams<Self> {
-        let ef = args.ef_search.max(nprobe);
-        let cfg = HNSWSearchConfiguration::default()
-            .with_ef_search(ef)
-            .with_early_termination(if args.lambda > 0.0 {
-                EarlyTerminationStrategy::DistanceAdaptive {
-                    lambda: args.lambda,
-                }
-            } else {
-                EarlyTerminationStrategy::None
-            });
-        IVFSearchParams {
-            nprobe,
-            centroid_search_params: cfg,
-            cluster_query_params: (),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Plain cluster dispatch
-// ---------------------------------------------------------------------------
-
-fn dispatch_plain(args: &Args, queries: &Queries) {
-    // Cluster storage is always dot-product; only the centroid metric (DQ) and
-    // value type differ. Residual-vs-plain is read from the index at runtime.
-    #[allow(non_camel_case_types)]
-    type DC32 = PlainDenseDataset<f32, DotProduct>;
-    #[allow(non_camel_case_types)]
-    type DC16 = PlainDenseDataset<f16, DotProduct>;
-    match (&args.distance, &args.value_type, args.hnsw) {
-        (MetricArg::Euclidean, ValueTypeArg::F32, false) => {
-            run_plain::<DQ_SE, DC32, FlatIndex<DQ_SE>>(args, queries)
-        }
-        (MetricArg::Euclidean, ValueTypeArg::F32, true) => {
-            run_plain::<DQ_SE, DC32, HNSW<DQ_SE, Graph>>(args, queries)
-        }
-        (MetricArg::Euclidean, ValueTypeArg::F16, false) => {
-            run_plain::<DQ_SE, DC16, FlatIndex<DQ_SE>>(args, queries)
-        }
-        (MetricArg::Euclidean, ValueTypeArg::F16, true) => {
-            run_plain::<DQ_SE, DC16, HNSW<DQ_SE, Graph>>(args, queries)
-        }
-        (MetricArg::Dotproduct, ValueTypeArg::F32, false) => {
-            run_plain::<DQ_DP, DC32, FlatIndex<DQ_DP>>(args, queries)
-        }
-        (MetricArg::Dotproduct, ValueTypeArg::F32, true) => {
-            run_plain::<DQ_DP, DC32, HNSW<DQ_DP, Graph>>(args, queries)
-        }
-        (MetricArg::Dotproduct, ValueTypeArg::F16, false) => {
-            run_plain::<DQ_DP, DC16, FlatIndex<DQ_DP>>(args, queries)
-        }
-        (MetricArg::Dotproduct, ValueTypeArg::F16, true) => {
-            run_plain::<DQ_DP, DC16, HNSW<DQ_DP, Graph>>(args, queries)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PQ cluster dispatch
-// ---------------------------------------------------------------------------
-
-fn dispatch_pq(args: &Args, queries: &Queries) {
-    // PQ storage is always dot-product; residual-vs-plain is read at runtime.
-    // Dispatch only on (centroid metric, HNSW, M).
-    macro_rules! pq_arms {
-        ($($m:literal),* $(,)?) => {
-            match (&args.distance, args.hnsw, args.m_pq) {
-                $(
-                    (MetricArg::Euclidean, false, Some($m)) => {
-                        run_pq::<$m, DQ_SE, FlatIndex<DQ_SE>>(args, queries)
-                    }
-                    (MetricArg::Euclidean, true, Some($m)) => {
-                        run_pq::<$m, DQ_SE, HNSW<DQ_SE, Graph>>(args, queries)
-                    }
-                    (MetricArg::Dotproduct, false, Some($m)) => {
-                        run_pq::<$m, DQ_DP, FlatIndex<DQ_DP>>(args, queries)
-                    }
-                    (MetricArg::Dotproduct, true, Some($m)) => {
-                        run_pq::<$m, DQ_DP, HNSW<DQ_DP, Graph>>(args, queries)
-                    }
-                )*
-                (_, _, Some(m)) => {
-                    eprintln!("Unsupported --m-pq {m}");
-                    process::exit(1);
-                }
-                (_, _, None) => unreachable!(),
+    match args.dataset_type {
+        DatasetType::Dense => {
+            let queries: DenseQueries = read_npy_f32(&args.query_file)
+                .unwrap_or_else(|e| fail(&format!("reading queries: {e:?}")));
+            match args.distance.as_ref().unwrap_or(&MetricArg::Euclidean) {
+                MetricArg::Euclidean => dense!(DQ_SE, &args, &queries),
+                MetricArg::Dotproduct => dense!(DQ_DP, &args, &queries),
             }
-        };
-    }
-    pq_arms!(4, 8, 16, 32, 48, 64, 96, 128, 192);
-}
-
-// ---------------------------------------------------------------------------
-// Plain cluster search
-// ---------------------------------------------------------------------------
-
-fn run_plain<DQ, DC, CI>(args: &Args, queries: &Queries)
-where
-    DQ: Dataset + serde::Serialize + for<'de> serde::Deserialize<'de>,
-    DC: Dataset + serde::Serialize + for<'de> serde::Deserialize<'de>,
-    CI: Index + MakeParams<DQ> + serde::Serialize + for<'de> serde::Deserialize<'de>,
-    for<'q> CI: Index<Query<'q> = <DQ::Encoder as VectorEncoder>::QueryVector<'q>>,
-    IVF<DQ, DC, CI>: IndexSerializer,
-    <DQ::Encoder as VectorEncoder>::Distance: ReportedMetric,
-    DC::Encoder: VectorEncoder<Distance = DotProduct, QueryParams = ()>,
-    for<'q> <DQ::Encoder as VectorEncoder>::QueryVector<'q>: From<DenseVectorView<'q, f32>>
-        + Into<<DC::Encoder as VectorEncoder>::QueryVector<'q>>
-        + Copy,
-    for<'q, 'b> <DC::Encoder as VectorEncoder>::Evaluator<'q>:
-        QueryEvaluator<<DC::Encoder as VectorEncoder>::EncodedVector<'b>, Distance = DotProduct>,
-{
-    let index: IVF<DQ, DC, CI> = <IVF<DQ, DC, CI> as IndexSerializer>::load_index(&args.index_file)
-        .unwrap_or_else(|e| {
-            eprintln!("Error loading index: {e:?}");
-            process::exit(1);
-        });
-    index.print_space_usage_bytes();
-    let params = CI::make_params(args.n_probe, args);
-    search_loop(&index, queries, &params, args);
-}
-
-// ---------------------------------------------------------------------------
-// PQ cluster search (dot-product PQ storage; centroid metric = DQ)
-// ---------------------------------------------------------------------------
-
-fn run_pq<const M: usize, DQ, CI>(args: &Args, queries: &Queries)
-where
-    DQ: Dataset + serde::Serialize + for<'de> serde::Deserialize<'de>,
-    <DQ::Encoder as VectorEncoder>::Distance: ReportedMetric,
-    CI: Index + MakeParams<DQ> + serde::Serialize + for<'de> serde::Deserialize<'de>,
-    for<'q> CI: Index<Query<'q> = <DQ::Encoder as VectorEncoder>::QueryVector<'q>>,
-    DenseDataset<ProductQuantizer<M, DotProduct>>: Dataset<Encoder = ProductQuantizer<M, DotProduct>>
-        + serde::Serialize
-        + for<'de> serde::Deserialize<'de>,
-    IVF<DQ, DenseDataset<ProductQuantizer<M, DotProduct>>, CI>: IndexSerializer,
-    ProductQuantizer<M, DotProduct>: DenseVectorEncoder<InputValueType = f32, OutputValueType = u8>
-        + VectorEncoder<Distance = DotProduct, QueryParams = ()>,
-    for<'q> <DQ::Encoder as VectorEncoder>::QueryVector<'q>: From<DenseVectorView<'q, f32>>
-        + Into<<ProductQuantizer<M, DotProduct> as VectorEncoder>::QueryVector<'q>>
-        + Copy,
-    for<'q, 'b> <ProductQuantizer<M, DotProduct> as VectorEncoder>::Evaluator<'q>: QueryEvaluator<
-            <ProductQuantizer<M, DotProduct> as VectorEncoder>::EncodedVector<'b>,
-            Distance = DotProduct,
-        >,
-{
-    type DP_<const N: usize> = DenseDataset<ProductQuantizer<N, DotProduct>>;
-
-    let index: IVF<DQ, DP_<M>, CI> = <IVF<DQ, DP_<M>, CI> as IndexSerializer>::load_index(
-        &args.index_file,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("Error loading index: {e:?}");
-        process::exit(1);
-    });
-    index.print_space_usage_bytes();
-    let params = CI::make_params(args.n_probe, args);
-    search_loop(&index, queries, &params, args);
-}
-
-// ---------------------------------------------------------------------------
-// Shared search loop
-// ---------------------------------------------------------------------------
-
-fn search_loop<DQ, DC, CI>(
-    index: &IVF<DQ, DC, CI>,
-    queries: &Queries,
-    params: &IVFSearchParams<CI>,
-    args: &Args,
-) where
-    DQ: Dataset,
-    DC: Dataset,
-    CI: Index,
-    for<'q> CI: Index<Query<'q> = <DQ::Encoder as VectorEncoder>::QueryVector<'q>>,
-    <DQ::Encoder as VectorEncoder>::Distance: ReportedMetric,
-    DC::Encoder: VectorEncoder<Distance = DotProduct, QueryParams = ()>,
-    for<'q> <DQ::Encoder as VectorEncoder>::QueryVector<'q>: From<DenseVectorView<'q, f32>>
-        + Into<<DC::Encoder as VectorEncoder>::QueryVector<'q>>
-        + Copy,
-    for<'q, 'b> <DC::Encoder as VectorEncoder>::Evaluator<'q>:
-        QueryEvaluator<<DC::Encoder as VectorEncoder>::EncodedVector<'b>, Distance = DotProduct>,
-{
-    let nq = queries.len();
-    let mut results = Vec::<(f32, usize)>::with_capacity(nq * args.k);
-    let mut total_us = 0u128;
-    for _ in 0..args.num_runs {
-        results.clear();
-        for query in queries.iter() {
-            let t = Instant::now();
-            let res = index.search(query.into(), args.k, params);
-            total_us += t.elapsed().as_micros();
-            results.extend(
-                res.iter()
-                    .map(|s| (s.distance.distance(), s.vector as usize)),
-            );
+        }
+        DatasetType::Sparse => {
+            if args.m_pq.is_some() || !matches!(args.encoder, EncoderType::Plain) {
+                fail("sparse IVF supports --encoder plain only.");
+            }
+            if matches!(args.distance, Some(MetricArg::Euclidean)) {
+                fail("sparse IVF reports dot product only.");
+            }
+            let queries: Sparse = read_seismic_format(&args.query_file)
+                .unwrap_or_else(|e| fail(&format!("reading queries: {e:?}")));
+            match args.value_type {
+                ValueTypeArg::F32 => {
+                    centroid_index::<Sparse, ScalarSparseDataset<u16, f32, f32, DotProduct>, _>(
+                        &args, &queries,
+                    )
+                }
+                ValueTypeArg::F16 => {
+                    centroid_index::<Sparse, ScalarSparseDataset<u16, f32, f16, DotProduct>, _>(
+                        &args, &queries,
+                    )
+                }
+            }
         }
     }
-    let avg = total_us / (nq * args.num_runs) as u128;
-    println!("[######] Average Query Time: {avg} μs");
-    if let Some(path) = &args.output_path {
-        write_results(path, &results, args.k);
+}
+
+/// Dispatch on the centroid index: flat or HNSW.
+fn centroid_index<DQ, D, Q>(args: &Args, queries: &Q)
+where
+    DQ: Dataset + Sync + SpaceUsage,
+    <DQ::Encoder as VectorEncoder>::Distance: Distance,
+    D: Dataset,
+    IVF<DQ, D, FlatIndex<DQ>>: Searchable<Q, CentroidParams = ()>,
+    IVF<DQ, D, HNSW<DQ, Graph>>: Searchable<Q, CentroidParams = HNSWSearchConfiguration>,
+{
+    if args.hnsw {
+        let cfg = HNSWSearchConfiguration::default()
+            .with_ef_search(args.ef_search.max(args.n_probe))
+            .with_early_termination(if args.lambda > 0.0 {
+                EarlyTerminationStrategy::DistanceAdaptive {
+                    lambda: args.lambda,
+                }
+            } else {
+                EarlyTerminationStrategy::None
+            });
+        IVF::<DQ, D, HNSW<DQ, Graph>>::run(args, queries, cfg);
+    } else {
+        IVF::<DQ, D, FlatIndex<DQ>>::run(args, queries, ());
+    }
+}
+
+/// An IVF that can be loaded and searched with queries from the dataset `Q`.
+trait Searchable<Q> {
+    type CentroidParams;
+    fn run(args: &Args, queries: &Q, centroid_search_params: Self::CentroidParams);
+}
+
+/// Query-side parameters of the cluster storage encoder, from the command line.
+trait ClusterQueryParams {
+    fn from_args(args: &Args) -> Self;
+}
+
+impl ClusterQueryParams for () {
+    fn from_args(_args: &Args) -> Self {}
+}
+
+impl ClusterQueryParams for RabitqQueryParams {
+    fn from_args(args: &Args) -> Self {
+        RabitqQueryParams {
+            query_bits: args.rabitq_query_bits,
+        }
+    }
+}
+
+impl<DQ, D, CI, Q> Searchable<Q> for IVF<DQ, D, CI>
+where
+    DQ: Dataset,
+    D: Dataset,
+    <D::Encoder as VectorEncoder>::QueryParams: ClusterQueryParams,
+    CI: Index,
+    Q: Dataset,
+    IVF<DQ, D, CI>: IndexSerializer
+        + Index<SearchParams = IVFSearchParams<CI, <D::Encoder as VectorEncoder>::QueryParams>>
+        + for<'de> serde::Deserialize<'de>,
+    for<'q> <Q::Encoder as VectorEncoder>::EncodedVector<'q>:
+        Into<<IVF<DQ, D, CI> as Index>::Query<'q>>,
+{
+    type CentroidParams = CI::SearchParams;
+
+    fn run(args: &Args, queries: &Q, centroid_search_params: CI::SearchParams) {
+        let index: Self = IndexSerializer::load_index(&args.index_file)
+            .unwrap_or_else(|e| fail(&format!("loading index: {e:?}")));
+        index.print_space_usage_bytes();
+        // A 1-bit RaBitQ query carries a per-query scale, which breaks adding exact terms (the
+        // L2 correction, a residual's centroid term) to its estimate.
+        let reports_l2 = matches!(args.dataset_type, DatasetType::Dense)
+            && !matches!(args.distance, Some(MetricArg::Dotproduct));
+        if matches!(args.encoder, EncoderType::Rabitq)
+            && args.rabitq_query_bits == 1
+            && (reports_l2 || index.is_residual())
+        {
+            fail("--rabitq-query-bits 1 is only valid for plain dot-product RaBitQ indexes.");
+        }
+        let params = IVFSearchParams {
+            nprobe: args.n_probe,
+            centroid_search_params,
+            cluster_query_params: ClusterQueryParams::from_args(args),
+        };
+
+        let nq = queries.len();
+        let mut results = Vec::<(f32, usize)>::with_capacity(nq * args.k);
+        let mut total_us = 0u128;
+        for _ in 0..args.num_runs {
+            results.clear();
+            for query in queries.iter() {
+                let t = Instant::now();
+                let res = Index::search(&index, query.into(), args.k, &params);
+                total_us += t.elapsed().as_micros();
+                results.extend(
+                    res.iter()
+                        .map(|s| (s.distance.distance(), s.vector as usize)),
+                );
+            }
+        }
+        let avg = total_us / (nq * args.num_runs) as u128;
+        println!("[######] Average Query Time: {avg} μs");
+        if let Some(path) = &args.output_path {
+            write_results(path, &results, args.k);
+        }
     }
 }
 

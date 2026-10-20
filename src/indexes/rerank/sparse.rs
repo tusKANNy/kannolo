@@ -22,7 +22,7 @@ use crate::graph::graph::Graph as GenericGraph;
 use crate::graph::neighbors::{PlainNeighbors, StreamVByteNeighbors};
 use crate::hnsw::{HNSW, HNSWBuildConfiguration, HNSWSearchConfiguration};
 
-use vectorium::core::rerank_index::RerankIndex;
+use crate::rerank_index::RerankIndex;
 use vectorium::distances::DotProduct;
 use vectorium::vector::SparseVectorView;
 use vectorium::{

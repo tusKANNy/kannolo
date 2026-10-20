@@ -37,7 +37,7 @@ pub mod utils;
 pub mod visited_set;
 
 pub mod indexes;
-pub use indexes::{hnsw, hnsw_utils, ivf, rerank};
+pub use indexes::{hnsw, hnsw_utils, ivf, rerank, rerank_index};
 
 #[cfg(feature = "python")]
 #[pymodule]
