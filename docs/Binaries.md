@@ -28,9 +28,9 @@ Options:
   -d, --data-file <DATA_FILE>
   -o, --output-file <OUTPUT_FILE>
       --dataset-type <DATASET_TYPE>      [possible values: dense, sparse]
-      --value-type <VALUE_TYPE>          [default: f32] [possible values: f16, f32, fixedu8, fixedu16]
+      --value-type <VALUE_TYPE>          [default: f32] [possible values: see "Sparse value types" below]
       --component-type <COMPONENT_TYPE>  [default: u16] [possible values: u16, u32]
-      --encoder <ENCODER>                [default: plain] [possible values: plain, pq, dotvbyte, rabitq, rabitq-ext]
+      --encoder <ENCODER>                [default: plain] [possible values: plain, pq, rabitq, rabitq-ext]
       --graph-type <GRAPH_TYPE>          [default: standard] [possible values: standard, fixed-degree, permuted, streamvbyte]
       --m <M>                            [default: 16]
       --ef-construction <EF_CONSTRUCTION> [default: 150]
@@ -54,9 +54,9 @@ Options:
   -q, --query-file <QUERY_FILE>
   -o, --output-path <OUTPUT_PATH>
       --dataset-type <DATASET_TYPE>      [possible values: dense, sparse]
-      --value-type <VALUE_TYPE>          [default: f32] [possible values: f16, f32, fixedu8, fixedu16]
+      --value-type <VALUE_TYPE>          [default: f32] [possible values: see "Sparse value types" below]
       --component-type <COMPONENT_TYPE>  [default: u16] [possible values: u16, u32]
-      --encoder <ENCODER>                [default: plain] [possible values: plain, pq, dotvbyte, rabitq, rabitq-ext]
+      --encoder <ENCODER>                [default: plain] [possible values: plain, pq, rabitq, rabitq-ext]
       --graph-type <GRAPH_TYPE>          [default: standard] [possible values: standard, fixed-degree, permuted, streamvbyte]
       --distance <DISTANCE>
       --pq-subspaces <PQ_SUBSPACES>      [default: 16]
@@ -280,19 +280,19 @@ Sparse plain with explicit sparse component type:
   --m 16 --ef-construction 150 --distance dotproduct
 ```
 
-Sparse DotVByte:
+Sparse DotPacking8 (the replacement of the removed `dotvbyte` encoder):
 
 ```bash
 ./hnsw_build --data-file data.bin --output-file index.bin \
-  --dataset-type sparse --encoder dotvbyte --component-type u16 \
+  --dataset-type sparse --value-type dotpacking8-fixedu8 --component-type u16 \
   --m 16 --ef-construction 150 --distance dotproduct
 ```
 
-Sparse DotVByte search:
+Sparse DotPacking8 search (`--value-type` and `--component-type` must match the build):
 
 ```bash
 ./hnsw_search --index-file index.bin --query-file queries.bin \
-  --dataset-type sparse --encoder dotvbyte --component-type u16 \
+  --dataset-type sparse --value-type dotpacking8-fixedu8 --component-type u16 \
   --distance dotproduct --k 10 --ef-search 40 --output-path results.tsv
 ```
 
@@ -318,16 +318,38 @@ IVF:
   --distance euclidean --value-type f32 --n-probe 32 --k 10 --output-path results.tsv
 ```
 
+## Sparse value types
+
+For sparse datasets, `--value-type` selects how the dataset is stored (`--encoder` stays `plain`).
+`hnsw_search` must be given the same `--value-type` and `--component-type` used at build time.
+
+| Value type | Component types | Distances | Storage |
+|---|---|---|---|
+| `f32`, `f16` | `u16`, `u32` | dotproduct, euclidean | plain values; the graph is built on them directly |
+| `fixedu8`, `fixedu16` | `u16`, `u32` | dotproduct, euclidean | fixed-point values (one scale for all components) |
+| `scalaru8`, `scalaru16` | `u16`, `u32` | dotproduct, euclidean | 8/16-bit codes with one trained step per component |
+| `blocked-sparse` | `u16` | dotproduct | 64-byte blocks of 16 entries, `f16` values (x86_64 only) |
+| `blocked-sparse-scalaru8`, `blocked-sparse-scalaru16` | `u16` | dotproduct | blocks with 8/16-bit per-component codes (x86_64 only) |
+| `dotpacking8-fixedu8` | `u16` | dotproduct | DotPacking8, fixed-point 8-bit values; replaces `dotvbyte` |
+| `dotpacking8-scalaru8`, `dotpacking8-scalaru16` | `u16`, `u32` (bridged) | dotproduct | DotPacking8, 8/16-bit per-component codes |
+| `dotpacking8-f16` | `u16` | dotproduct | DotPacking8, `f16` values |
+| `dotpacking8-scalar4bit` | `u16` | dotproduct | DotPacking8, 4-bit per-component codes |
+
+Every value type except `f32` and `f16` builds the graph on the `f32` dataset and then
+re-encodes the dataset. The blocked layouts need AVX2/F16C/FMA (build with
+`RUSTFLAGS="-C target-cpu=native"`) and are not compiled on other architectures. Indexes built
+with the removed `dotvbyte` encoder cannot be loaded and must be rebuilt.
+
 ## Validation Rules
 
 The binaries reject invalid combinations:
 
 1. `pq` is dense-only.
 2. `rabitq` and `rabitq-ext` are dense-only.
-3. `dotvbyte` is sparse-only.
-4. `fixedu8` and `fixedu16` value types are sparse-only.
-5. `component-type` is sparse-only.
-6. `dotvbyte` requires `component-type = u16`.
+3. Dense datasets accept only the `f32` and `f16` value types; every other value type is sparse-only.
+4. `component-type` is sparse-only.
+5. The blocked and DotPacking8 value types support only `dotproduct`, and only `component-type = u16` except `dotpacking8-scalaru8` and `dotpacking8-scalaru16`.
+6. `dotvbyte` (as `--encoder` or `--value-type`) was removed; the binaries exit naming `dotpacking8-fixedu8` instead.
 7. `pq-subspaces` must be one of `4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256` and must divide the vector dimensionality.
 8. For PQ, `--nbits` and `--sample-size` are accepted for compatibility but ignored by vectorium.
 9. `--rabitq-total-bits` must be 2, 4 or 8; for a 1-bit code use `--encoder rabitq` instead.

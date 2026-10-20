@@ -1,4 +1,5 @@
-//! `SparseDotVByteHNSW`: HNSW over DotVByte-packed sparse data (dotproduct only).
+//! `SparseDotPacking8HNSW`: HNSW over DotPacking8-packed sparse data with fixed-point 8-bit
+//! values (u16 components, dotproduct only).
 
 use std::f32;
 
@@ -16,60 +17,58 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 
 use vectorium::distances::DotProduct;
-use vectorium::encoders::dotvbyte_fixedu8::DotVByteFixedU8Encoder;
 use vectorium::readers::read_seismic_format;
 use vectorium::vector::SparseVectorView;
-use vectorium::{PackedSparseDataset, PlainSparseDataset};
+use vectorium::{DotPacking8U16FixedU8Dataset, PlainSparseDataset};
 
 use super::{GraphTypeKind, load_index_err, parse_build_graph_type, parse_graph_type};
 use crate::pylib::common::{
     build_sparse_dataset_from_parts, convert_components_to_u16, push_results,
 };
 
-enum SparseDotVByteHNSWEnum {
-    Plain(HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, Graph>),
-    StreamVByte(
-        HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, GenericGraph<StreamVByteNeighbors>>,
-    ),
+enum SparseDotPacking8HNSWEnum {
+    Plain(HNSW<DotPacking8U16FixedU8Dataset, Graph>),
+    StreamVByte(HNSW<DotPacking8U16FixedU8Dataset, GenericGraph<StreamVByteNeighbors>>),
 }
 
 /// Applies `gt` to a plain-built sparse HNSW (permuting via EGB when requested) and
-/// converts it into the DotVByte-packed dataset representation.
+/// converts it into the DotPacking8 dataset representation.
 ///
-/// **The conversion must run before `permute_and_encode`**, for the reason spelled out on
-/// `build_permuted_and_save` in `src/bin/hnsw_build.rs`: the DotVByte component mapping is fitted
-/// on a *prefix sample* of the dataset, so permuting first would train it on an EGB-clustered
-/// prefix and yield a worse encoding than the `standard` path gets.
-fn build_sparse_dotvbyte_inner(
+/// The conversion runs before `permute_and_encode`, as in `build_permuted_and_save` in
+/// `src/bin/hnsw_build.rs`: the encoder is then trained exactly as on the `standard` path and
+/// the permutation copies the encoded rows verbatim.
+fn build_sparse_dotpacking8_inner(
     plain_hnsw: HNSW<PlainSparseDataset<u16, f32, DotProduct>, Graph>,
     gt: GraphTypeKind,
-) -> SparseDotVByteHNSWEnum {
+) -> SparseDotPacking8HNSWEnum {
     match gt {
         GraphTypeKind::Standard => {
-            let packed: HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, Graph> =
+            let packed: HNSW<DotPacking8U16FixedU8Dataset, Graph> =
                 plain_hnsw.convert_dataset_into(());
-            SparseDotVByteHNSWEnum::Plain(packed)
+            SparseDotPacking8HNSWEnum::Plain(packed)
         }
         GraphTypeKind::Permuted => {
-            let packed: HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, Graph> =
+            let packed: HNSW<DotPacking8U16FixedU8Dataset, Graph> =
                 plain_hnsw.convert_dataset_into(());
-            SparseDotVByteHNSWEnum::Plain(packed.permute_and_encode::<PlainNeighbors>())
+            SparseDotPacking8HNSWEnum::Plain(packed.permute_and_encode::<PlainNeighbors>())
         }
         GraphTypeKind::Compressed => {
-            let packed: HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, Graph> =
+            let packed: HNSW<DotPacking8U16FixedU8Dataset, Graph> =
                 plain_hnsw.convert_dataset_into(());
-            SparseDotVByteHNSWEnum::StreamVByte(packed.permute_and_encode::<StreamVByteNeighbors>())
+            SparseDotPacking8HNSWEnum::StreamVByte(
+                packed.permute_and_encode::<StreamVByteNeighbors>(),
+            )
         }
     }
 }
 
 #[pyclass]
-pub struct SparseDotVByteHNSW {
-    inner: SparseDotVByteHNSWEnum,
+pub struct SparseDotPacking8HNSW {
+    inner: SparseDotPacking8HNSWEnum,
 }
 
 #[pymethods]
-impl SparseDotVByteHNSW {
+impl SparseDotPacking8HNSW {
     #[staticmethod]
     #[pyo3(signature = (data_file, m=32, ef_construction=200, graph_type="standard".to_string()))]
     pub fn build_from_file(
@@ -92,9 +91,9 @@ impl SparseDotVByteHNSW {
             })?;
 
         let plain_hnsw: HNSW<_, Graph> = HNSW::build_index(dataset, &config);
-        let inner = build_sparse_dotvbyte_inner(plain_hnsw, gt);
+        let inner = build_sparse_dotpacking8_inner(plain_hnsw, gt);
 
-        Ok(SparseDotVByteHNSW { inner })
+        Ok(SparseDotPacking8HNSW { inner })
     }
 
     #[staticmethod]
@@ -134,17 +133,17 @@ impl SparseDotVByteHNSW {
             d,
         )?;
         let plain_hnsw: HNSW<_, Graph> = HNSW::build_index(dataset, &config);
-        let inner = build_sparse_dotvbyte_inner(plain_hnsw, gt);
+        let inner = build_sparse_dotpacking8_inner(plain_hnsw, gt);
 
-        Ok(SparseDotVByteHNSW { inner })
+        Ok(SparseDotPacking8HNSW { inner })
     }
 
     pub fn save(&self, path: &str) -> PyResult<()> {
         match &self.inner {
-            SparseDotVByteHNSWEnum::Plain(index) => index.save_index(path).map_err(|e| {
+            SparseDotPacking8HNSWEnum::Plain(index) => index.save_index(path).map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Error saving index: {:?}", e))
             }),
-            SparseDotVByteHNSWEnum::StreamVByte(index) => index.save_index(path).map_err(|e| {
+            SparseDotPacking8HNSWEnum::StreamVByte(index) => index.save_index(path).map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Error saving index: {:?}", e))
             }),
         }
@@ -157,29 +156,27 @@ impl SparseDotVByteHNSW {
     pub fn load(path: &str, graph_type: String) -> PyResult<Self> {
         let inner = match parse_graph_type(&graph_type)? {
             GraphTypeKind::Standard | GraphTypeKind::Permuted => {
-                let index: HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, Graph> = <HNSW<
-                    PackedSparseDataset<DotVByteFixedU8Encoder>,
-                    Graph,
-                > as IndexSerializer>::load_index(
-                    path
-                )
-                .map_err(load_index_err)?;
-                SparseDotVByteHNSWEnum::Plain(index)
+                let index: HNSW<DotPacking8U16FixedU8Dataset, Graph> =
+                    <HNSW<DotPacking8U16FixedU8Dataset, Graph> as IndexSerializer>::load_index(
+                        path,
+                    )
+                    .map_err(load_index_err)?;
+                SparseDotPacking8HNSWEnum::Plain(index)
             }
             GraphTypeKind::Compressed => {
                 let index: HNSW<
-                    PackedSparseDataset<DotVByteFixedU8Encoder>,
+                    DotPacking8U16FixedU8Dataset,
                     GenericGraph<StreamVByteNeighbors>,
                 > = <HNSW<
-                    PackedSparseDataset<DotVByteFixedU8Encoder>,
+                    DotPacking8U16FixedU8Dataset,
                     GenericGraph<StreamVByteNeighbors>,
                 > as IndexSerializer>::load_index(path)
                 .map_err(load_index_err)?;
-                SparseDotVByteHNSWEnum::StreamVByte(index)
+                SparseDotPacking8HNSWEnum::StreamVByte(index)
             }
         };
 
-        Ok(SparseDotVByteHNSW { inner })
+        Ok(SparseDotPacking8HNSW { inner })
     }
 
     /// Search for approximate nearest neighbors for a single compressed sparse query.
@@ -216,7 +213,7 @@ impl SparseDotVByteHNSW {
         let mut distances = Vec::with_capacity(k);
         let query_view = SparseVectorView::new(&comp_vec, values_slice);
         match &self.inner {
-            SparseDotVByteHNSWEnum::Plain(index) => {
+            SparseDotPacking8HNSWEnum::Plain(index) => {
                 push_results(
                     index.search(query_view, k, &search_config),
                     k,
@@ -224,7 +221,7 @@ impl SparseDotVByteHNSW {
                     &mut ids,
                 );
             }
-            SparseDotVByteHNSWEnum::StreamVByte(index) => {
+            SparseDotPacking8HNSWEnum::StreamVByte(index) => {
                 push_results(
                     index.search(query_view, k, &search_config),
                     k,
@@ -293,7 +290,7 @@ impl SparseDotVByteHNSW {
             let mut distances = Vec::with_capacity(k);
             let mut ids = Vec::with_capacity(k);
             match &self.inner {
-                SparseDotVByteHNSWEnum::Plain(index) => {
+                SparseDotPacking8HNSWEnum::Plain(index) => {
                     push_results(
                         index.search(query_view, k, &search_config),
                         k,
@@ -301,7 +298,7 @@ impl SparseDotVByteHNSW {
                         &mut ids,
                     );
                 }
-                SparseDotVByteHNSWEnum::StreamVByte(index) => {
+                SparseDotPacking8HNSWEnum::StreamVByte(index) => {
                     push_results(
                         index.search(query_view, k, &search_config),
                         k,

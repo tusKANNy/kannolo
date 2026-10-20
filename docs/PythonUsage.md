@@ -2,7 +2,7 @@
 
 Kannolo provides a Python interface for vector search with support for:
 - **Dense indexes**: Plain and PQ-encoded HNSW
-- **Sparse indexes**: Multiple encoding schemes (plain, DotVByte, FixedU8, FixedU16)
+- **Sparse indexes**: Multiple encoding schemes (plain, DotPacking8, FixedU8, FixedU16)
 - **Flat (brute-force) indexes**: Dense and sparse exhaustive search
 - **Multivector reranking**: Two-stage sparse + multivector retrieval
 
@@ -17,7 +17,7 @@ from kannolo import (
     
     # Sparse HNSW
     SparsePlainHNSW,     # Sparse plain HNSW
-    SparseDotVByteHNSW,  # Sparse DotVByte-encoded HNSW
+    SparseDotPacking8HNSW,  # Sparse DotPacking8 HNSW (u16 components, fixed-point u8 values)
     SparseFixedU8HNSW,   # Sparse fixed u8-encoded HNSW
     SparseFixedU16HNSW,  # Sparse fixed u16-encoded HNSW
     SparseFlatIndex,     # Sparse exhaustive (brute-force) search
@@ -125,11 +125,13 @@ index = SparsePlainHNSW.build_from_arrays(
 )
 ```
 
-### Sparse Variants (DotVByte, FixedU8, FixedU16)
+### Sparse Variants (DotPacking8, FixedU8, FixedU16)
 
 ```python
 # All follow the same interface as SparsePlainHNSW
-index = SparseDotVByteHNSW.build_from_file("data.bin", m=32, ef_construction=200)
+# SparseDotPacking8HNSW replaces SparseDotVByteHNSW (removed with vectorium's DotVByte encoder);
+# it supports only dotproduct and u16 components. Old DotVByte index files must be rebuilt.
+index = SparseDotPacking8HNSW.build_from_file("data.bin", m=32, ef_construction=200)
 index = SparseFixedU8HNSW.build_from_file("data.bin", m=32, ef_construction=200, metric="dotproduct")
 index = SparseFixedU16HNSW.build_from_file("data.bin", m=32, ef_construction=200, metric="dotproduct")
 ```
@@ -391,7 +393,7 @@ queries = np.random.randn(100, 768).astype(np.float32)
 dists, ids = index.batch_search(queries.flatten(), k=10, num_threads=0)
 ```
 
-### Sparse HNSW (`SparsePlainHNSW`, `SparseDotVByteHNSW`, `SparseFixedU8HNSW`, `SparseFixedU16HNSW`)
+### Sparse HNSW (`SparsePlainHNSW`, `SparseDotPacking8HNSW`, `SparseFixedU8HNSW`, `SparseFixedU16HNSW`)
 
 ```python
 # Single query: components and values only, no offsets.
@@ -572,7 +574,7 @@ by `save()`: call `build_acorn_gamma` again after `load()`.
 | Dense vectors, memory limited | `DensePQHNSW` | Quantized, faster search |
 | Dense vectors, ground truth/exhaustive search | `DenseFlatIndex` | Exhaustive, exact neighbors |
 | Sparse vectors, standard | `SparsePlainHNSW` | Plain encoding, good recall |
-| Sparse vectors, memory limited | `SparseFixedU8HNSW` or `SparseDotVByteHNSW` | Compressed |
+| Sparse vectors, memory limited | `SparseFixedU8HNSW` or `SparseDotPacking8HNSW` | Compressed |
 | Sparse vectors, ground truth/exhaustive search | `SparseFlatIndex` | Exhaustive, exact |
 | Dense vectors, compressed first stage + rerank | `DenseRerankHNSW` | Compressed HNSW + `f16` or RaBitQ-ext rerank |
 | Sparse vectors, pruned or quantized first stage + rerank | `SparseRerankHNSW` | L1-pruned HNSW + residual or full-vector rerank |

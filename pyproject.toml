@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kannolo"
-version = "0.13.0"
+version = "0.14.0"
 description = "Python interface for the kANNolo library"
 requires-python = ">=3.9"
 classifiers = [

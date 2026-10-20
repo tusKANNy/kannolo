@@ -53,9 +53,11 @@ Build an HNSW index from dense or sparse data.
 
 **Data type parameters:**
 ```bash
---encoder <type>          plain (default), pq (dense only), dotvbyte (sparse only).
---value-type <type>       f32 (default), f16, fixedu8 (sparse only), fixedu16 (sparse only).
---component-type <type>   u16 (default), u32. (sparse only; dotvbyte requires u16)
+--encoder <type>          plain (default), pq, rabitq, rabitq-ext (dense only).
+--value-type <type>       f32 (default), f16; sparse only: fixedu8, fixedu16, scalaru8, scalaru16,
+                          blocked-sparse[-scalaru8|-scalaru16], dotpacking8-{fixedu8, scalaru8,
+                          scalaru16, f16, scalar4bit}. See docs/Binaries.md#sparse-value-types.
+--component-type <type>   u16 (default), u32. (sparse only; blocked and most dotpacking8 types require u16)
 ```
 
 **Search parameters:**
@@ -114,12 +116,12 @@ Results are identical for every graph type. See [GraphCompression.md](GraphCompr
   --ef-construction 200 \
   --distance dotproduct
 
-# Sparse DotVByte index
+# Sparse DotPacking8 index (replaces the removed dotvbyte encoder)
 ./target/release/hnsw_build \
   --data-file documents.bin \
   --output-file index.bin \
   --dataset-type sparse \
-  --encoder dotvbyte \
+  --value-type dotpacking8-fixedu8 \
   --component-type u16 \
   --m 32 \
   --ef-construction 2000 \
@@ -149,9 +151,9 @@ Search an HNSW index with dense or sparse queries.
 
 **Data type parameters:**
 ```bash
---encoder <type>          plain (default), pq, dotvbyte (must match index)
---value-type <type>       f32 (default), f16, fixedu8, fixedu16
---component-type <type>   u16 (default), u32
+--encoder <type>          plain (default), pq, rabitq, rabitq-ext (must match index)
+--value-type <type>       f32 (default), f16, ... (same list as hnsw_build; must match index)
+--component-type <type>   u16 (default), u32 (must match index)
 ```
 
 **Distance & search:**

@@ -6,9 +6,9 @@ dataset =       "Splade cocondenser on MS-MARCO"
 build-command = "./target/release/hnsw_build"  # Unified build binary
 query-command = "./target/release/hnsw_search" # Unified search binary
 dataset-type = "sparse"   # Dataset type: "dense" or "sparse"
-component-type = "u16"    # DotVByte supports only u16
-value-type = "fixedu8"    # Ignored by the dotvbyte encoder, kept for consistency
-encoder       = "dotvbyte" # Encoder: "plain" for no compression, "dotvbyte" (sparse only)
+component-type = "u16"    # dotpacking8-fixedu8 supports only u16
+value-type = "dotpacking8-fixedu8" # Replaces the removed "dotvbyte" encoder
+encoder       = "plain"   # Sparse indexes select their representation with value-type
 graph-type = "standard"   # Default graph type; each [query.*] subsection may override it
 
 [settings]
@@ -36,7 +36,7 @@ index =         "index_cocondenser" # index file name
 [indexing_parameters]
 m =             32
 ef-construction = 2000
-metric =        "dotproduct" # DotVByte supports only dotproduct
+metric =        "dotproduct" # DotPacking8 supports only dotproduct
 
 # Graph compression is decided at BUILD time via --graph-type and must match at search time,
 # so each graph type needs its own index. The runner builds one index per distinct graph-type
@@ -52,13 +52,9 @@ metric =        "dotproduct" # DotVByte supports only dotproduct
 #   standard -> permuted     isolates the locality gain from EGB reordering
 #   permuted -> streamvbyte  isolates the cost of decoding compressed adjacency lists
 #
-# Note: the EGB permutation is applied to the plain sparse dataset and the DotVByte encoding
-# happens afterwards, so no packed row is re-encoded — but the *encoding is still not
-# order-invariant*. DotVByteFixedU8Encoder derives its component permutation with a recursive
-# bisection whose input is the set of document IDs each component occurs in, so reordering
-# documents changes the component mapping. Measured on this dataset, the EGB order made the
-# encoded dataset 2.1% larger (2,528,063,302 -> 2,582,051,822 bytes). Both `permuted` and
-# `streamvbyte` pay that, so the two share a dataset and their difference stays clean.
+# Note: the DotPacking8 encoding happens before the EGB permutation, which then copies the
+# encoded rows verbatim, so `standard`, `permuted` and `streamvbyte` share the same encoded
+# dataset (up to row order) and their differences come from the graph alone.
 [query]
     [query.recall_90_standard]
     early-termination = "distance-adaptive"

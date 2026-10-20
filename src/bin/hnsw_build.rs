@@ -15,15 +15,21 @@ use vectorium::IndexSerializer;
 use vectorium::dataset::ConvertFrom;
 use vectorium::distances::{DotProduct, SquaredEuclideanDistance};
 use vectorium::encoders::dense_scalar::{PlainDenseQuantizer, ScalarDenseSupportedDistance};
-use vectorium::encoders::dotvbyte_fixedu8::DotVByteFixedU8Encoder;
 use vectorium::encoders::pq::ProductQuantizer;
 use vectorium::encoders::sparse_scalar::ScalarSparseSupportedDistance;
 use vectorium::readers::{read_npy_f32, read_seismic_format};
 use vectorium::vector_encoder::{DenseVectorEncoder, VectorEncoder};
+#[cfg(target_arch = "x86_64")]
 use vectorium::{
-    Dataset, DenseDataset, FixedU8Q, FixedU16Q, Float, FromF32, PackedSparseDataset,
-    PlainDenseDataset, PlainSparseDataset, RabitqConfig, RabitqExtConfig, RabitqExtQuantizer,
-    RabitqQuantizer, RabitqSupportedDistance, ScalarSparseDataset, SpaceUsage, ValueType,
+    BlockedSparseDataset, BlockedSparseScalarU8Dataset, BlockedSparseScalarU16Dataset,
+};
+use vectorium::{
+    BridgedDotPacking8U32ScalarU8Dataset, BridgedDotPacking8U32ScalarU16Dataset, Dataset,
+    DenseDataset, DotPacking8U16F16Dataset, DotPacking8U16FixedU8Dataset,
+    DotPacking8U16Scalar4BitDataset, DotPacking8U16ScalarU8Dataset, DotPacking8U16ScalarU16Dataset,
+    FixedU8Q, FixedU16Q, Float, FromF32, PlainDenseDataset, PlainSparseDataset, RabitqConfig,
+    RabitqExtConfig, RabitqExtQuantizer, RabitqQuantizer, RabitqSupportedDistance,
+    ScalarSparseDataset, ScalarU8SparseDataset, ScalarU16SparseDataset, SpaceUsage, ValueType,
 };
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -33,9 +39,8 @@ enum DatasetType {
 }
 
 /// Value type for stored values.
-/// Dense plain: `f32`, `f16`.
-/// Sparse plain: `f32`, `f16`, `fixedu8`, `fixedu16`.
-/// Ignored for `dotvbyte` and `pq` (they fix their own value representation).
+/// Dense plain: `f32`, `f16`. Sparse: every variant (see `docs/Binaries.md`).
+/// Ignored for `pq`, `rabitq` and `rabitq-ext` (they fix their own value representation).
 #[derive(Debug, Clone, ValueEnum, Default)]
 enum ValueTypeArg {
     F16,
@@ -43,28 +48,99 @@ enum ValueTypeArg {
     F32,
     Fixedu8,
     Fixedu16,
+    /// 8-bit codes with one trained quantization step per component.
+    Scalaru8,
+    /// 16-bit codes with one trained quantization step per component.
+    Scalaru16,
+    /// 64-byte blocks of 16 `u16` components with `f16` values (x86_64 only).
+    #[cfg(target_arch = "x86_64")]
+    #[value(name = "blocked-sparse")]
+    BlockedSparse,
+    #[cfg(target_arch = "x86_64")]
+    #[value(name = "blocked-sparse-scalaru8")]
+    BlockedSparseScalaru8,
+    #[cfg(target_arch = "x86_64")]
+    #[value(name = "blocked-sparse-scalaru16")]
+    BlockedSparseScalaru16,
+    /// DotPacking8 with fixed-point 8-bit values: the replacement of the removed `dotvbyte`.
+    #[value(name = "dotpacking8-fixedu8")]
+    Dotpacking8Fixedu8,
+    /// DotPacking8 with per-component 8-bit codes (bridged encoding for `u32` components).
+    #[value(name = "dotpacking8-scalaru8")]
+    Dotpacking8Scalaru8,
+    /// DotPacking8 with per-component 16-bit codes (bridged encoding for `u32` components).
+    #[value(name = "dotpacking8-scalaru16")]
+    Dotpacking8Scalaru16,
+    #[value(name = "dotpacking8-f16")]
+    Dotpacking8F16,
+    #[value(name = "dotpacking8-scalar4bit")]
+    Dotpacking8Scalar4bit,
+}
+
+impl ValueTypeArg {
+    /// Whether dense plain datasets can store this value type.
+    fn is_dense(&self) -> bool {
+        matches!(self, ValueTypeArg::F32 | ValueTypeArg::F16)
+    }
+
+    /// Packed layouts (DotPacking8, blocked) score with dot product only.
+    fn is_dot_product_only(&self) -> bool {
+        self.is_packed()
+    }
+
+    /// Packed layouts with no `u32` encoding.
+    fn is_u16_only(&self) -> bool {
+        self.is_packed()
+            && !matches!(
+                self,
+                ValueTypeArg::Dotpacking8Scalaru8 | ValueTypeArg::Dotpacking8Scalaru16
+            )
+    }
+
+    fn is_packed(&self) -> bool {
+        !matches!(
+            self,
+            ValueTypeArg::F16
+                | ValueTypeArg::F32
+                | ValueTypeArg::Fixedu8
+                | ValueTypeArg::Fixedu16
+                | ValueTypeArg::Scalaru8
+                | ValueTypeArg::Scalaru16
+        )
+    }
 }
 
 impl std::fmt::Display for ValueTypeArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ValueTypeArg::F16 => write!(f, "f16"),
-            ValueTypeArg::F32 => write!(f, "f32"),
-            ValueTypeArg::Fixedu8 => write!(f, "fixedu8"),
-            ValueTypeArg::Fixedu16 => write!(f, "fixedu16"),
-        }
+        let value = self
+            .to_possible_value()
+            .expect("no value type is skipped by clap");
+        write!(f, "{}", value.get_name())
+    }
+}
+
+/// `dotvbyte` was removed in vectorium 0.11. Name its replacement instead of letting clap reject
+/// the value with its generic "invalid value" message.
+fn reject_removed_names() {
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "dotvbyte" || a.ends_with("=dotvbyte"))
+    {
+        eprintln!(
+            "Error: 'dotvbyte': DotVByte was removed in vectorium 0.11; use '--value-type dotpacking8-fixedu8'."
+        );
+        process::exit(2);
     }
 }
 
 /// Encoder type.
 /// Dense: `plain`, `pq`, `rabitq`, `rabitq-ext`.
-/// Sparse: `plain`, `dotvbyte`.
+/// Sparse: `plain` (`--value-type` selects the representation).
 #[derive(Debug, Clone, ValueEnum, Default)]
 enum EncoderType {
     #[default]
     Plain,
     Pq,
-    Dotvbyte,
     /// RaBitQ: 1-bit-per-component document codes.
     Rabitq,
     /// Extended RaBitQ: `--rabitq-total-bits` per component (2, 4 or 8).
@@ -76,7 +152,6 @@ impl std::fmt::Display for EncoderType {
         match self {
             EncoderType::Plain => write!(f, "plain"),
             EncoderType::Pq => write!(f, "pq"),
-            EncoderType::Dotvbyte => write!(f, "dotvbyte"),
             EncoderType::Rabitq => write!(f, "rabitq"),
             EncoderType::RabitqExt => write!(f, "rabitq-ext"),
         }
@@ -117,19 +192,21 @@ struct Args {
     #[clap(long, value_enum)]
     dataset_type: DatasetType,
 
-    /// Value type for stored values. Dense plain: f32, f16. Sparse plain: f32, f16, fixedu8, fixedu16.
-    /// Ignored for dotvbyte and pq (they determine their own value representation).
+    /// Value type for stored values. Dense plain: f32, f16. Sparse: f32, f16, fixedu8, fixedu16,
+    /// scalaru8, scalaru16, blocked-sparse[-scalaru8|-scalaru16], dotpacking8-{fixedu8, scalaru8,
+    /// scalaru16, f16, scalar4bit}. Ignored for pq and rabitq (they determine their own values).
     #[clap(long = "value-type", value_enum)]
     #[arg(default_value_t = ValueTypeArg::F32)]
     value_type: ValueTypeArg,
 
     /// Component type for sparse datasets (`u16` or `u32`).
-    /// DotVByte currently supports only `u16`.
+    /// Blocked and DotPacking8 value types support only `u16`, except dotpacking8-scalaru8 and
+    /// dotpacking8-scalaru16.
     #[clap(long = "component-type", value_enum)]
     #[arg(default_value_t = ComponentTypeArg::U16)]
     component_type: ComponentTypeArg,
 
-    /// Encoder type. Dense: plain, pq, rabitq, rabitq-ext. Sparse: plain, dotvbyte.
+    /// Encoder type. Dense: plain, pq, rabitq, rabitq-ext. Sparse: plain.
     #[clap(long, value_enum)]
     #[arg(default_value_t = EncoderType::Plain)]
     encoder: EncoderType,
@@ -278,9 +355,11 @@ fn choose_pq_subspaces(dim: usize, requested: usize) -> usize {
 }
 
 fn main() {
+    reject_removed_names();
     let args: Args = Args::parse();
+    let distance = parse_metric(&args.distance);
 
-    // Cross-validation of encoder / dataset-type combinations
+    // Cross-validation of encoder / dataset-type / value-type combinations
     match (&args.dataset_type, &args.encoder) {
         (DatasetType::Sparse, EncoderType::Pq) => {
             eprintln!("Error: PQ encoder is only available for dense vectors.");
@@ -290,27 +369,35 @@ fn main() {
             eprintln!("Error: RaBitQ encoders are only available for dense vectors.");
             process::exit(1);
         }
-        (DatasetType::Dense, EncoderType::Dotvbyte) => {
-            eprintln!("Error: DotVByte encoder is only available for sparse vectors.");
-            process::exit(1);
-        }
-        (DatasetType::Dense, EncoderType::Plain)
-            if matches!(
-                args.value_type,
-                ValueTypeArg::Fixedu8 | ValueTypeArg::Fixedu16
-            ) =>
-        {
-            eprintln!("Error: fixedu8/fixedu16 value types are only available for sparse vectors.");
+        (DatasetType::Dense, EncoderType::Plain) if !args.value_type.is_dense() => {
+            eprintln!(
+                "Error: value type {} is only available for sparse vectors.",
+                args.value_type
+            );
             process::exit(1);
         }
         (DatasetType::Dense, _) if !matches!(args.component_type, ComponentTypeArg::U16) => {
             eprintln!("Error: component-type is only applicable to sparse datasets.");
             process::exit(1);
         }
-        (DatasetType::Sparse, EncoderType::Dotvbyte)
-            if !matches!(args.component_type, ComponentTypeArg::U16) =>
+        (DatasetType::Sparse, _)
+            if args.value_type.is_u16_only()
+                && !matches!(args.component_type, ComponentTypeArg::U16) =>
         {
-            eprintln!("Error: DotVByte encoder supports only component-type u16.");
+            eprintln!(
+                "Error: value type {} supports only component-type u16.",
+                args.value_type
+            );
+            process::exit(1);
+        }
+        (DatasetType::Sparse, _)
+            if args.value_type.is_dot_product_only()
+                && !matches!(distance, Distance::DotProduct) =>
+        {
+            eprintln!(
+                "Error: value type {} supports only dotproduct distance.",
+                args.value_type
+            );
             process::exit(1);
         }
         _ => {}
@@ -335,8 +422,6 @@ fn main() {
             eprintln!("Warning: vectorium PQ ignores --sample-size and uses automatic sampling.");
         }
     }
-
-    let distance = parse_metric(&args.distance);
 
     let config = HNSWBuildConfiguration::default()
         .with_num_neighbors(args.m)
@@ -418,105 +503,11 @@ fn main() {
         (DatasetType::Dense, EncoderType::RabitqExt, _, GraphType::Streamvbyte) => {
             build_dense_rabitq_ext_permuted::<StreamVByteNeighbors>(&args, distance, &config);
         }
-        // Sparse plain f32
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F32, GraphType::Standard) => {
-            build_sparse_plain::<f32, Graph<PlainNeighbors>>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F32, GraphType::FixedDegree) => {
-            build_sparse_plain::<f32, GraphFixedDegree>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F32, GraphType::Permuted) => {
-            build_sparse_plain_permuted::<f32, PlainNeighbors>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F32, GraphType::Streamvbyte) => {
-            build_sparse_plain_permuted::<f32, StreamVByteNeighbors>(&args, distance, &config);
-        }
-        // Sparse plain f16
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F16, GraphType::Standard) => {
-            build_sparse_plain::<f16, Graph<PlainNeighbors>>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F16, GraphType::FixedDegree) => {
-            build_sparse_plain::<f16, GraphFixedDegree>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F16, GraphType::Permuted) => {
-            build_sparse_plain_permuted::<f16, PlainNeighbors>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F16, GraphType::Streamvbyte) => {
-            build_sparse_plain_permuted::<f16, StreamVByteNeighbors>(&args, distance, &config);
-        }
-        // Sparse plain fixedu8
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::Fixedu8, GraphType::Standard) => {
-            build_sparse_scalar::<FixedU8Q, Graph<PlainNeighbors>>(&args, distance, &config);
-        }
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu8,
-            GraphType::FixedDegree,
-        ) => {
-            build_sparse_scalar::<FixedU8Q, GraphFixedDegree>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::Fixedu8, GraphType::Permuted) => {
-            build_sparse_scalar_permuted::<FixedU8Q, PlainNeighbors>(&args, distance, &config);
-        }
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu8,
-            GraphType::Streamvbyte,
-        ) => {
-            build_sparse_scalar_permuted::<FixedU8Q, StreamVByteNeighbors>(
-                &args, distance, &config,
-            );
-        }
-        // Sparse plain fixedu16
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::Fixedu16, GraphType::Standard) => {
-            build_sparse_scalar::<FixedU16Q, Graph<PlainNeighbors>>(&args, distance, &config);
-        }
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu16,
-            GraphType::FixedDegree,
-        ) => {
-            build_sparse_scalar::<FixedU16Q, GraphFixedDegree>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::Fixedu16, GraphType::Permuted) => {
-            build_sparse_scalar_permuted::<FixedU16Q, PlainNeighbors>(&args, distance, &config);
-        }
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu16,
-            GraphType::Streamvbyte,
-        ) => {
-            build_sparse_scalar_permuted::<FixedU16Q, StreamVByteNeighbors>(
-                &args, distance, &config,
-            );
-        }
-        // Sparse dotvbyte (value-type ignored)
-        (DatasetType::Sparse, EncoderType::Dotvbyte, _, GraphType::Standard) => {
-            build_sparse_dotvbyte::<Graph<PlainNeighbors>>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Dotvbyte, _, GraphType::FixedDegree) => {
-            build_sparse_dotvbyte::<GraphFixedDegree>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Dotvbyte, _, GraphType::Permuted) => {
-            build_sparse_dotvbyte_permuted::<PlainNeighbors>(&args, distance, &config);
-        }
-        (DatasetType::Sparse, EncoderType::Dotvbyte, _, GraphType::Streamvbyte) => {
-            build_sparse_dotvbyte_permuted::<StreamVByteNeighbors>(&args, distance, &config);
-        }
+        (DatasetType::Sparse, EncoderType::Plain, _, _) => build_sparse(&args, distance, &config),
         // Unreachable: caught by earlier validation
-        (DatasetType::Dense, EncoderType::Dotvbyte, _, _)
-        | (DatasetType::Sparse, EncoderType::Pq, _, _)
+        (DatasetType::Sparse, EncoderType::Pq, _, _)
         | (DatasetType::Sparse, EncoderType::Rabitq | EncoderType::RabitqExt, _, _)
-        | (
-            DatasetType::Dense,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu8 | ValueTypeArg::Fixedu16,
-            _,
-        ) => {
+        | (DatasetType::Dense, EncoderType::Plain, _, _) => {
             unreachable!()
         }
     }
@@ -719,286 +710,176 @@ where
     DenseDataset::from_raw(data.into_boxed_slice(), n_vecs, encoder)
 }
 
-fn build_sparse_plain<V, G>(args: &Args, distance: Distance, config: &HNSWBuildConfiguration)
-where
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    G: GraphBound,
-{
-    match args.component_type {
-        ComponentTypeArg::U16 => {
-            build_sparse_plain_with_component::<u16, V, G>(args, distance, config)
+/// Runs `$body` with `$c` and `$d` bound, as type aliases, to the `--component-type` and the
+/// distance, so that one generic call covers the four (component type, distance) pairs.
+macro_rules! with_component_and_distance {
+    ($args:expr, $distance:expr, |$c:ident, $d:ident| $body:expr) => {
+        match (&$args.component_type, $distance) {
+            (ComponentTypeArg::U16, Distance::DotProduct) => {
+                type $c = u16;
+                type $d = DotProduct;
+                $body
+            }
+            (ComponentTypeArg::U16, Distance::Euclidean) => {
+                type $c = u16;
+                type $d = SquaredEuclideanDistance;
+                $body
+            }
+            (ComponentTypeArg::U32, Distance::DotProduct) => {
+                type $c = u32;
+                type $d = DotProduct;
+                $body
+            }
+            (ComponentTypeArg::U32, Distance::Euclidean) => {
+                type $c = u32;
+                type $d = SquaredEuclideanDistance;
+                $body
+            }
         }
-        ComponentTypeArg::U32 => {
-            build_sparse_plain_with_component::<u32, V, G>(args, distance, config)
-        }
-    }
+    };
 }
 
-fn build_sparse_plain_with_component<C, V, G>(
-    args: &Args,
-    distance: Distance,
-    config: &HNSWBuildConfiguration,
-) where
-    C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage + Serialize,
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    G: GraphBound,
-{
-    match distance {
-        Distance::Euclidean => {
-            build_sparse_plain_with_distance::<C, V, SquaredEuclideanDistance, G>(args, config)
+/// Sparse datasets. `f32` and `f16` build the graph on the stored values; every other value type
+/// builds it on `f32` and then re-encodes the dataset. Value types that are dot-product-only or
+/// `u16`-only were validated in `main`.
+fn build_sparse(args: &Args, distance: Distance, config: &HNSWBuildConfiguration) {
+    let u32_components = matches!(args.component_type, ComponentTypeArg::U32);
+    match args.value_type {
+        ValueTypeArg::F32 => with_component_and_distance!(args, distance, |C, D| {
+            build_sparse_plain::<C, f32, D>(args, config)
+        }),
+        ValueTypeArg::F16 => with_component_and_distance!(args, distance, |C, D| {
+            build_sparse_plain::<C, f16, D>(args, config)
+        }),
+        ValueTypeArg::Fixedu8 => with_component_and_distance!(args, distance, |C, D| {
+            build_sparse_converted::<C, D, ScalarSparseDataset<C, f32, FixedU8Q, D>>(args, config)
+        }),
+        ValueTypeArg::Fixedu16 => with_component_and_distance!(args, distance, |C, D| {
+            build_sparse_converted::<C, D, ScalarSparseDataset<C, f32, FixedU16Q, D>>(args, config)
+        }),
+        ValueTypeArg::Scalaru8 => with_component_and_distance!(args, distance, |C, D| {
+            build_sparse_converted::<C, D, ScalarU8SparseDataset<C, D>>(args, config)
+        }),
+        ValueTypeArg::Scalaru16 => with_component_and_distance!(args, distance, |C, D| {
+            build_sparse_converted::<C, D, ScalarU16SparseDataset<C, D>>(args, config)
+        }),
+        #[cfg(target_arch = "x86_64")]
+        ValueTypeArg::BlockedSparse => {
+            build_sparse_converted::<u16, DotProduct, BlockedSparseDataset>(args, config)
         }
-        Distance::DotProduct => {
-            build_sparse_plain_with_distance::<C, V, DotProduct, G>(args, config)
+        #[cfg(target_arch = "x86_64")]
+        ValueTypeArg::BlockedSparseScalaru8 => {
+            build_sparse_converted::<u16, DotProduct, BlockedSparseScalarU8Dataset>(args, config)
         }
-    }
-}
-
-fn build_sparse_plain_with_distance<C, V, D, G>(args: &Args, config: &HNSWBuildConfiguration)
-where
-    C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage + Serialize,
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    D: ScalarSparseSupportedDistance,
-    G: GraphBound,
-{
-    let dataset: PlainSparseDataset<C, V, D> =
-        read_seismic_format::<C, V, D>(&args.data_file).unwrap();
-    build_and_save::<_, _, G>(dataset, config, &args.output_file, |i| i);
-}
-
-fn build_sparse_plain_permuted<V, Ndst>(
-    args: &Args,
-    distance: Distance,
-    config: &HNSWBuildConfiguration,
-) where
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    Ndst: NeighborsBound,
-{
-    match args.component_type {
-        ComponentTypeArg::U16 => {
-            build_sparse_plain_permuted_with_component::<u16, V, Ndst>(args, distance, config)
+        #[cfg(target_arch = "x86_64")]
+        ValueTypeArg::BlockedSparseScalaru16 => {
+            build_sparse_converted::<u16, DotProduct, BlockedSparseScalarU16Dataset>(args, config)
         }
-        ComponentTypeArg::U32 => {
-            build_sparse_plain_permuted_with_component::<u32, V, Ndst>(args, distance, config)
+        ValueTypeArg::Dotpacking8Fixedu8 => {
+            build_sparse_converted::<u16, DotProduct, DotPacking8U16FixedU8Dataset>(args, config)
         }
-    }
-}
-
-fn build_sparse_plain_permuted_with_component<C, V, Ndst>(
-    args: &Args,
-    distance: Distance,
-    config: &HNSWBuildConfiguration,
-) where
-    C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage + Serialize,
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    Ndst: NeighborsBound,
-{
-    match distance {
-        Distance::Euclidean => {
-            build_sparse_plain_permuted_with_distance::<C, V, SquaredEuclideanDistance, Ndst>(
+        ValueTypeArg::Dotpacking8Scalaru8 if u32_components => {
+            build_sparse_converted::<u32, DotProduct, BridgedDotPacking8U32ScalarU8Dataset>(
                 args, config,
             )
         }
-        Distance::DotProduct => {
-            build_sparse_plain_permuted_with_distance::<C, V, DotProduct, Ndst>(args, config)
+        ValueTypeArg::Dotpacking8Scalaru8 => {
+            build_sparse_converted::<u16, DotProduct, DotPacking8U16ScalarU8Dataset>(args, config)
         }
-    }
-}
-
-fn build_sparse_plain_permuted_with_distance<C, V, D, Ndst>(
-    args: &Args,
-    config: &HNSWBuildConfiguration,
-) where
-    C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage + Serialize,
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    D: ScalarSparseSupportedDistance,
-    Ndst: NeighborsBound,
-{
-    let dataset: PlainSparseDataset<C, V, D> =
-        read_seismic_format::<C, V, D>(&args.data_file).unwrap();
-    build_permuted_and_save::<_, _, Ndst>(dataset, config, &args.output_file, |i| i);
-}
-
-// --- DotVByte (encoder = dotvbyte, DotProduct only) ---
-
-fn build_sparse_dotvbyte<G>(args: &Args, distance: Distance, config: &HNSWBuildConfiguration)
-where
-    G: GraphBound,
-{
-    match distance {
-        Distance::Euclidean => {
-            eprintln!("Error: DotVByte encoder only supports dotproduct distance.");
-            process::exit(1);
-        }
-        Distance::DotProduct => build_sparse_dotvbyte_dp::<G>(args, config),
-    }
-}
-
-fn build_sparse_dotvbyte_dp<G>(args: &Args, config: &HNSWBuildConfiguration)
-where
-    G: GraphBound,
-{
-    let dataset: PlainSparseDataset<u16, f32, DotProduct> =
-        read_seismic_format::<u16, f32, DotProduct>(&args.data_file).unwrap_or_else(|e| {
-            eprintln!("Error reading dataset: {e:?}");
-            process::exit(1);
-        });
-    build_and_save::<_, PackedSparseDataset<DotVByteFixedU8Encoder>, G>(
-        dataset,
-        config,
-        &args.output_file,
-        |i| i.convert_dataset_into(()),
-    );
-}
-
-fn build_sparse_dotvbyte_permuted<Ndst>(
-    args: &Args,
-    distance: Distance,
-    config: &HNSWBuildConfiguration,
-) where
-    Ndst: NeighborsBound,
-{
-    match distance {
-        Distance::Euclidean => {
-            eprintln!("Error: DotVByte encoder only supports dotproduct distance.");
-            process::exit(1);
-        }
-        Distance::DotProduct => build_sparse_dotvbyte_dp_permuted::<Ndst>(args, config),
-    }
-}
-
-fn build_sparse_dotvbyte_dp_permuted<Ndst>(args: &Args, config: &HNSWBuildConfiguration)
-where
-    Ndst: NeighborsBound,
-{
-    let dataset: PlainSparseDataset<u16, f32, DotProduct> =
-        read_seismic_format::<u16, f32, DotProduct>(&args.data_file).unwrap_or_else(|e| {
-            eprintln!("Error reading dataset: {e:?}");
-            process::exit(1);
-        });
-    build_permuted_and_save::<_, PackedSparseDataset<DotVByteFixedU8Encoder>, Ndst>(
-        dataset,
-        config,
-        &args.output_file,
-        |i| i.convert_dataset_into(()),
-    );
-}
-
-fn build_sparse_scalar<V, G>(args: &Args, distance: Distance, config: &HNSWBuildConfiguration)
-where
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    G: GraphBound,
-{
-    match args.component_type {
-        ComponentTypeArg::U16 => {
-            build_sparse_scalar_with_component::<u16, V, G>(args, distance, config)
-        }
-        ComponentTypeArg::U32 => {
-            build_sparse_scalar_with_component::<u32, V, G>(args, distance, config)
-        }
-    }
-}
-
-fn build_sparse_scalar_with_component<C, V, G>(
-    args: &Args,
-    distance: Distance,
-    config: &HNSWBuildConfiguration,
-) where
-    C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage + Serialize,
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    G: GraphBound,
-{
-    match distance {
-        Distance::Euclidean => {
-            build_sparse_scalar_with_distance::<C, V, SquaredEuclideanDistance, G>(args, config)
-        }
-        Distance::DotProduct => {
-            build_sparse_scalar_with_distance::<C, V, DotProduct, G>(args, config)
-        }
-    }
-}
-
-fn build_sparse_scalar_with_distance<C, V, D, G>(args: &Args, config: &HNSWBuildConfiguration)
-where
-    C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage + Serialize,
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    D: ScalarSparseSupportedDistance,
-    G: GraphBound,
-    ScalarSparseDataset<C, f32, V, D>: ConvertFrom<PlainSparseDataset<C, f32, D>, Config = ()>,
-{
-    let dataset: PlainSparseDataset<C, f32, D> = read_seismic_format::<C, f32, D>(&args.data_file)
-        .unwrap_or_else(|e| {
-            eprintln!("Error reading dataset: {e:?}");
-            process::exit(1);
-        });
-    build_and_save::<_, ScalarSparseDataset<C, f32, V, D>, G>(
-        dataset,
-        config,
-        &args.output_file,
-        |i| i.convert_dataset_into(()),
-    );
-}
-
-fn build_sparse_scalar_permuted<V, Ndst>(
-    args: &Args,
-    distance: Distance,
-    config: &HNSWBuildConfiguration,
-) where
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    Ndst: NeighborsBound,
-{
-    match args.component_type {
-        ComponentTypeArg::U16 => {
-            build_sparse_scalar_permuted_with_component::<u16, V, Ndst>(args, distance, config)
-        }
-        ComponentTypeArg::U32 => {
-            build_sparse_scalar_permuted_with_component::<u32, V, Ndst>(args, distance, config)
-        }
-    }
-}
-
-fn build_sparse_scalar_permuted_with_component<C, V, Ndst>(
-    args: &Args,
-    distance: Distance,
-    config: &HNSWBuildConfiguration,
-) where
-    C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage + Serialize,
-    V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
-    Ndst: NeighborsBound,
-{
-    match distance {
-        Distance::Euclidean => {
-            build_sparse_scalar_permuted_with_distance::<C, V, SquaredEuclideanDistance, Ndst>(
+        ValueTypeArg::Dotpacking8Scalaru16 if u32_components => {
+            build_sparse_converted::<u32, DotProduct, BridgedDotPacking8U32ScalarU16Dataset>(
                 args, config,
             )
         }
-        Distance::DotProduct => {
-            build_sparse_scalar_permuted_with_distance::<C, V, DotProduct, Ndst>(args, config)
+        ValueTypeArg::Dotpacking8Scalaru16 => {
+            build_sparse_converted::<u16, DotProduct, DotPacking8U16ScalarU16Dataset>(args, config)
+        }
+        ValueTypeArg::Dotpacking8F16 => {
+            build_sparse_converted::<u16, DotProduct, DotPacking8U16F16Dataset>(args, config)
+        }
+        ValueTypeArg::Dotpacking8Scalar4bit => {
+            build_sparse_converted::<u16, DotProduct, DotPacking8U16Scalar4BitDataset>(args, config)
         }
     }
 }
 
-fn build_sparse_scalar_permuted_with_distance<C, V, D, Ndst>(
-    args: &Args,
-    config: &HNSWBuildConfiguration,
-) where
+fn read_sparse_dataset<C, V, D>(args: &Args) -> PlainSparseDataset<C, V, D>
+where
+    C: vectorium::ComponentType + num_traits::FromPrimitive,
+    V: ValueType + Float + FromF32 + SpaceUsage,
+    D: ScalarSparseSupportedDistance,
+{
+    read_seismic_format::<C, V, D>(&args.data_file).unwrap_or_else(|e| {
+        eprintln!("Error reading dataset: {e:?}");
+        process::exit(1);
+    })
+}
+
+/// Builds the graph directly on the `V` values read from the dataset file.
+fn build_sparse_plain<C, V, D>(args: &Args, config: &HNSWBuildConfiguration)
+where
     C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage + Serialize,
     V: ValueType + Float + FromF32 + SpaceUsage + Serialize,
     D: ScalarSparseSupportedDistance,
-    Ndst: NeighborsBound,
-    ScalarSparseDataset<C, f32, V, D>: ConvertFrom<PlainSparseDataset<C, f32, D>, Config = ()>,
-    ScalarSparseDataset<C, f32, V, D>: Dataset<Owned = ScalarSparseDataset<C, f32, V, D>>,
 {
-    let dataset: PlainSparseDataset<C, f32, D> = read_seismic_format::<C, f32, D>(&args.data_file)
-        .unwrap_or_else(|e| {
-            eprintln!("Error reading dataset: {e:?}");
-            process::exit(1);
-        });
-    build_permuted_and_save::<_, ScalarSparseDataset<C, f32, V, D>, Ndst>(
-        dataset,
-        config,
-        &args.output_file,
-        |i| i.convert_dataset_into(()),
-    );
+    let dataset: PlainSparseDataset<C, V, D> = read_sparse_dataset(args);
+    let output_file = &args.output_file;
+    match args.graph_type {
+        GraphType::Standard => {
+            build_and_save::<_, _, Graph<PlainNeighbors>>(dataset, config, output_file, |i| i)
+        }
+        GraphType::FixedDegree => {
+            build_and_save::<_, _, GraphFixedDegree>(dataset, config, output_file, |i| i)
+        }
+        GraphType::Permuted => {
+            build_permuted_and_save::<_, _, PlainNeighbors>(dataset, config, output_file, |i| i)
+        }
+        GraphType::Streamvbyte => build_permuted_and_save::<_, _, StreamVByteNeighbors>(
+            dataset,
+            config,
+            output_file,
+            |i| i,
+        ),
+    }
+}
+
+/// Builds the graph on the `f32` dataset, then re-encodes the dataset into `Dfinal`.
+fn build_sparse_converted<C, D, Dfinal>(args: &Args, config: &HNSWBuildConfiguration)
+where
+    C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage + Serialize,
+    D: ScalarSparseSupportedDistance,
+    Dfinal: ConvertFrom<PlainSparseDataset<C, f32, D>, Config = ()>
+        + Dataset<Owned = Dfinal>
+        + Sync
+        + SpaceUsage
+        + Serialize,
+{
+    let dataset: PlainSparseDataset<C, f32, D> = read_sparse_dataset(args);
+    let output_file = &args.output_file;
+    match args.graph_type {
+        GraphType::Standard => {
+            build_and_save::<_, Dfinal, Graph<PlainNeighbors>>(dataset, config, output_file, |i| {
+                i.convert_dataset_into(())
+            })
+        }
+        GraphType::FixedDegree => {
+            build_and_save::<_, Dfinal, GraphFixedDegree>(dataset, config, output_file, |i| {
+                i.convert_dataset_into(())
+            })
+        }
+        GraphType::Permuted => build_permuted_and_save::<_, Dfinal, PlainNeighbors>(
+            dataset,
+            config,
+            output_file,
+            |i| i.convert_dataset_into(()),
+        ),
+        GraphType::Streamvbyte => build_permuted_and_save::<_, Dfinal, StreamVByteNeighbors>(
+            dataset,
+            config,
+            output_file,
+            |i| i.convert_dataset_into(()),
+        ),
+    }
 }
 
 fn build_dense_pq_with_m_l2<const M: usize, G>(
@@ -1263,7 +1144,7 @@ impl<T> NeighborsBound for T where
 ///
 /// `convert` is the only per-encoder variation: identity (`|i| i`) when the built index is
 /// already final, or `|i| i.convert_dataset_into(())` to re-encode the dataset (PQ, scalar,
-/// DotVByte) while keeping the graph unchanged.
+/// DotPacking8, blocked) while keeping the graph unchanged.
 fn build_and_save<Dsrc, Dfinal, G>(
     dataset: Dsrc,
     config: &HNSWBuildConfiguration,
@@ -1293,13 +1174,10 @@ fn build_and_save<Dsrc, Dfinal, G>(
 /// Like [`build_and_save`], but for the `permuted`/`streamvbyte` graph types: `convert` runs
 /// first, then the index is rebuilt under an EGB node reordering into a fresh `Ndst` backend.
 ///
-/// **`convert` must run before `permute_and_encode`.** Encoders that are fitted to the data — the
-/// DotVByte component mapping in particular — train on a *prefix sample* of the dataset
-/// (`SAMPLE_RATE` in vectorium's `PackedSparseDataset` conversion). Permuting first would hand
-/// that sampler an EGB-clustered prefix instead of a representative one, yielding a different,
-/// worse encoding than the `standard` index gets. Converting first keeps the encoder identical
-/// to the `standard` path, and `Dataset::permute` then copies the already-encoded rows verbatim,
-/// so the permuted dataset is byte-identical to the unpermuted one up to row order.
+/// **`convert` runs before `permute_and_encode`.** Encoders fitted to the data (the DotPacking8
+/// component order, the per-component quantization steps) are then trained exactly as on the
+/// `standard` path, and `Dataset::permute` copies the already-encoded rows verbatim, so the
+/// permuted dataset is byte-identical to the unpermuted one up to row order.
 fn build_permuted_and_save<Dsrc, Dfinal, Ndst>(
     dataset: Dsrc,
     config: &HNSWBuildConfiguration,

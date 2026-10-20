@@ -151,7 +151,7 @@ impl EarlyTerminationStrategy {
 /// `P` is the query-side parameter type of the dataset encoder
 /// ([`VectorEncoder::QueryParams`]). It defaults to `()`, so `HNSWSearchConfiguration`
 /// written without a parameter still means "an encoder that takes no query configuration"
-/// (plain, scalar, PQ, DotVByte). Encoders that do take query configuration — RaBitQ's
+/// (plain, scalar, PQ, DotPacking8). Encoders that do take query configuration — RaBitQ's
 /// `query_bits`, for instance — pin it to their own type, and the graph search forwards
 /// [`query_params`](Self::query_params) verbatim when it builds the evaluator.
 pub struct HNSWSearchConfiguration<P = ()> {
@@ -294,10 +294,9 @@ where
     /// # use kannolo::graph::Graph;
     /// # use kannolo::hnsw::{HNSW, HNSWBuildConfiguration};
     /// # use vectorium::distances::DotProduct;
-    /// # use vectorium::encoders::dotvbyte_fixedu8::DotVByteFixedU8Encoder;
     /// # use vectorium::vector::SparseVectorView;
     /// # use vectorium::{
-    /// #     DatasetGrowable, PackedSparseDataset, PlainSparseDataset,
+    /// #     DatasetGrowable, DotPacking8U16FixedU8Dataset, PlainSparseDataset,
     /// #     PlainSparseDatasetGrowable, PlainSparseQuantizer,
     /// # };
     /// # let mut growable = PlainSparseDatasetGrowable::new(
@@ -314,8 +313,8 @@ where
     /// #     .with_ef_construction(8);
     /// let plain: HNSW<PlainSparseDataset<u16, f32, DotProduct>, Graph> =
     ///     HNSW::build_index(dataset, &config);
-    /// // DotVByte learns everything from the source, so its `ConvertFrom::Config` is `()`.
-    /// let compressed: HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, Graph> =
+    /// // DotPacking8 learns everything from the source, so its `ConvertFrom::Config` is `()`.
+    /// let compressed: HNSW<DotPacking8U16FixedU8Dataset, Graph> =
     ///     plain.convert_dataset_into(());
     /// ```
     pub fn convert_dataset_into<T>(self, config: <T as ConvertFrom<D>>::Config) -> HNSW<T, G>
@@ -1572,16 +1571,23 @@ where
 mod convert_dataset_tests {
     use super::*;
     use crate::graph::Graph;
-    use vectorium::encoders::dotvbyte_fixedu8::DotVByteFixedU8Encoder;
     use vectorium::{
-        DatasetGrowable, DotProduct, FixedU8Q, FixedU16Q, IndexStats, PackedSparseDataset,
+        BridgedDotPacking8U32ScalarU8Dataset, ComponentType, DatasetGrowable,
+        DotPacking8U16FixedU8Dataset, DotProduct, FixedU8Q, FixedU16Q, IndexStats,
         PlainSparseDataset, PlainSparseDatasetGrowable, PlainSparseQuantizer, ScalarSparseDataset,
-        SparseVectorView,
+        ScalarU8SparseDataset, SparseVectorView,
     };
 
     fn build_test_hnsw() -> HNSW<PlainSparseDataset<u16, f32, DotProduct>, Graph> {
-        let encoder = PlainSparseQuantizer::<u16, f32, DotProduct>::new(20, 20);
-        let mut growable: PlainSparseDatasetGrowable<u16, f32, DotProduct> =
+        build_test_hnsw_with::<u16>()
+    }
+
+    fn build_test_hnsw_with<C>() -> HNSW<PlainSparseDataset<C, f32, DotProduct>, Graph>
+    where
+        C: ComponentType + num_traits::FromPrimitive + SpaceUsage,
+    {
+        let encoder = PlainSparseQuantizer::<C, f32, DotProduct>::new(20, 20);
+        let mut growable: PlainSparseDatasetGrowable<C, f32, DotProduct> =
             PlainSparseDatasetGrowable::new(encoder);
 
         for i in 0u16..30 {
@@ -1590,10 +1596,14 @@ mod convert_dataset_tests {
             components.sort();
             components.dedup();
             let values: Vec<f32> = components.iter().map(|&c| (c as f32 + 1.0) * 0.1).collect();
+            let components: Vec<C> = components
+                .iter()
+                .map(|&c| C::from_u16(c).unwrap())
+                .collect();
             growable.push(SparseVectorView::new(&components, &values));
         }
 
-        let dataset: PlainSparseDataset<u16, f32, DotProduct> = growable.into();
+        let dataset: PlainSparseDataset<C, f32, DotProduct> = growable.into();
 
         let config = HNSWBuildConfiguration::default()
             .with_num_neighbors(4)
@@ -1603,12 +1613,11 @@ mod convert_dataset_tests {
     }
 
     #[test]
-    fn test_convert_dataset_into_dotvbyte() {
+    fn test_convert_dataset_into_dotpacking8_fixedu8() {
         let plain_hnsw = build_test_hnsw();
         let n = plain_hnsw.n_elements();
 
-        let hnsw: HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, Graph> =
-            plain_hnsw.convert_dataset_into(());
+        let hnsw: HNSW<DotPacking8U16FixedU8Dataset, Graph> = plain_hnsw.convert_dataset_into(());
 
         assert_eq!(hnsw.n_elements(), n);
     }
@@ -1636,8 +1645,8 @@ mod convert_dataset_tests {
     }
 
     #[test]
-    fn test_dotvbyte_search_returns_results() {
-        let hnsw: HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, Graph> =
+    fn test_dotpacking8_fixedu8_search_returns_results() {
+        let hnsw: HNSW<DotPacking8U16FixedU8Dataset, Graph> =
             build_test_hnsw().convert_dataset_into(());
 
         let query_components: Vec<u16> = vec![0, 1, 2];
@@ -1673,6 +1682,38 @@ mod convert_dataset_tests {
             build_test_hnsw().convert_dataset_into(());
 
         let query_components: Vec<u16> = vec![0, 1, 2];
+        let query_values: Vec<f32> = vec![0.5, 0.3, 0.2];
+        let query = SparseVectorView::new(&query_components, &query_values);
+
+        let search_config = HNSWSearchConfiguration::default().with_ef_search(20);
+        let results = hnsw.search(query, 5, &search_config);
+
+        assert!(!results.is_empty());
+        assert!(results.len() <= 5);
+    }
+
+    #[test]
+    fn test_scalaru8_search_returns_results() {
+        let hnsw: HNSW<ScalarU8SparseDataset<u16, DotProduct>, Graph> =
+            build_test_hnsw().convert_dataset_into(());
+
+        let query_components: Vec<u16> = vec![0, 1, 2];
+        let query_values: Vec<f32> = vec![0.5, 0.3, 0.2];
+        let query = SparseVectorView::new(&query_components, &query_values);
+
+        let search_config = HNSWSearchConfiguration::default().with_ef_search(20);
+        let results = hnsw.search(query, 5, &search_config);
+
+        assert!(!results.is_empty());
+        assert!(results.len() <= 5);
+    }
+
+    #[test]
+    fn test_bridged_dotpacking8_u32_search_returns_results() {
+        let hnsw: HNSW<BridgedDotPacking8U32ScalarU8Dataset, Graph> =
+            build_test_hnsw_with::<u32>().convert_dataset_into(());
+
+        let query_components: Vec<u32> = vec![0, 1, 2];
         let query_values: Vec<f32> = vec![0.5, 0.3, 0.2];
         let query = SparseVectorView::new(&query_components, &query_values);
 
@@ -1993,17 +2034,14 @@ mod permute_compress_tests {
     /// before the permutation, never after — which is why `build_permuted_and_save` in
     /// `src/bin/hnsw_build.rs` runs `convert` before `permute_and_encode`.
     ///
-    /// This test cannot fail on its own: vectorium's DotVByte conversion trains its component
-    /// mapping on a prefix sample only above 1M rows (below that, `len / SAMPLE_RATE < 50_000`
-    /// falls back to the whole dataset), far more than a unit test can afford to build. It locks
-    /// the contract for the future; the regression it guards was found by comparing the reported
-    /// dataset sizes of the `standard` and `permuted` indexes on the real 8.8M-document
-    /// collection, where they differed by 47.8 MB.
+    /// The DotPacking8 conversion trains its component order and value steps on every vector, so
+    /// this test locks the contract rather than a known failure: it was introduced for the
+    /// removed DotVByte encoder, which trained on a prefix sample, and whose `standard` and
+    /// `permuted` indexes differed by 47.8 MB on the real 8.8M-document collection.
     #[test]
-    fn permuting_preserves_the_encoded_dotvbyte_dataset() {
-        use vectorium::encoders::dotvbyte_fixedu8::DotVByteFixedU8Encoder;
+    fn permuting_preserves_the_encoded_dotpacking8_dataset() {
         use vectorium::{
-            DatasetGrowable, DotProduct, PackedSparseDataset, PlainSparseDataset,
+            DatasetGrowable, DotPacking8U16FixedU8Dataset, DotProduct, PlainSparseDataset,
             PlainSparseDatasetGrowable, PlainSparseQuantizer, SparseVectorView,
         };
 
@@ -2030,7 +2068,7 @@ mod permute_compress_tests {
             HNSW::build_index(dataset, &config);
 
         // Same order as `build_permuted_and_save`: encode first, permute second.
-        let standard: HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, Graph<PlainNeighbors>> =
+        let standard: HNSW<DotPacking8U16FixedU8Dataset, Graph<PlainNeighbors>> =
             plain.convert_dataset_into(());
         let permuted = standard.permute_and_encode::<PlainNeighbors>();
 
