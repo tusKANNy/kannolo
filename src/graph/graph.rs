@@ -258,7 +258,8 @@ pub trait GraphTrait {
             for &neighbor_local_id in neighbors {
                 let range = dataset
                     .range_from_id(self.get_external_id(neighbor_local_id as usize) as VectorId);
-                dataset.prefetch_with_range(range);
+                // 256 bytes: higher values may evict lines the search still needs, 256 is enough to trigger hardware prefetching.
+                dataset.prefetch_with_range(range, 256);
             }
 
             // Buffer up to 6 unvisited neighbours for batch distance computation.

@@ -13,14 +13,21 @@ use vectorium::IndexSerializer;
 use vectorium::core::index::Index;
 use vectorium::distances::{Distance, DotProduct, SquaredEuclideanDistance};
 use vectorium::encoders::dense_scalar::{PlainDenseQuantizer, ScalarDenseSupportedDistance};
-use vectorium::encoders::dotvbyte_fixedu8::DotVByteFixedU8Encoder;
 use vectorium::encoders::pq::{ProductQuantizer, ProductQuantizerDistance};
 use vectorium::encoders::sparse_scalar::ScalarSparseSupportedDistance;
 use vectorium::readers::{read_npy_f32, read_seismic_format};
+use vectorium::vector::SparseVectorView;
+use vectorium::vector_encoder::VectorEncoder;
 use vectorium::{
-    Dataset, DenseDataset, FixedU8Q, FixedU16Q, PackedSparseDataset, PlainDenseDataset,
-    PlainSparseDataset, RabitqExtQuantizer, RabitqQuantizer, RabitqQueryParams,
-    RabitqSupportedDistance, ScalarSparseDataset,
+    BlockedSparseDataset, BlockedSparseScalarU8Dataset, BlockedSparseScalarU16Dataset,
+};
+use vectorium::{
+    BridgedDotPacking8U32ScalarU8Dataset, BridgedDotPacking8U32ScalarU16Dataset, Dataset,
+    DenseDataset, DotPacking8U16F16Dataset, DotPacking8U16FixedU8Dataset,
+    DotPacking8U16Scalar4BitDataset, DotPacking8U16ScalarU8Dataset, DotPacking8U16ScalarU16Dataset,
+    FixedU8Q, FixedU16Q, PlainDenseDataset, PlainSparseDataset, RabitqExtQuantizer,
+    RabitqQuantizer, RabitqQueryParams, RabitqSupportedDistance, ScalarSparseDataset,
+    ScalarU8SparseDataset, ScalarU16SparseDataset, SpaceUsage,
 };
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -30,9 +37,8 @@ enum DatasetType {
 }
 
 /// Value type for stored values.
-/// Dense plain: `f32`, `f16`.
-/// Sparse plain: `f32`, `f16`, `fixedu8`, `fixedu16`.
-/// Ignored for `dotvbyte` and `pq`.
+/// Dense plain: `f32`, `f16`. Sparse: every variant (see `docs/Binaries.md`).
+/// Ignored for `pq`, `rabitq` and `rabitq-ext` (they fix their own value representation).
 #[derive(Debug, Clone, ValueEnum, Default)]
 enum ValueTypeArg {
     F16,
@@ -40,28 +46,96 @@ enum ValueTypeArg {
     F32,
     Fixedu8,
     Fixedu16,
+    /// 8-bit codes with one trained quantization step per component.
+    Scalaru8,
+    /// 16-bit codes with one trained quantization step per component.
+    Scalaru16,
+    /// 64-byte blocks of 16 `u16` components with `f16` values.
+    #[value(name = "blocked-sparse")]
+    BlockedSparse,
+    #[value(name = "blocked-sparse-scalaru8")]
+    BlockedSparseScalaru8,
+    #[value(name = "blocked-sparse-scalaru16")]
+    BlockedSparseScalaru16,
+    /// DotPacking8 with fixed-point 8-bit values: the replacement of the removed `dotvbyte`.
+    #[value(name = "dotpacking8-fixedu8")]
+    Dotpacking8Fixedu8,
+    /// DotPacking8 with per-component 8-bit codes (bridged encoding for `u32` components).
+    #[value(name = "dotpacking8-scalaru8")]
+    Dotpacking8Scalaru8,
+    /// DotPacking8 with per-component 16-bit codes (bridged encoding for `u32` components).
+    #[value(name = "dotpacking8-scalaru16")]
+    Dotpacking8Scalaru16,
+    #[value(name = "dotpacking8-f16")]
+    Dotpacking8F16,
+    #[value(name = "dotpacking8-scalar4bit")]
+    Dotpacking8Scalar4bit,
+}
+
+impl ValueTypeArg {
+    /// Whether dense plain datasets can store this value type.
+    fn is_dense(&self) -> bool {
+        matches!(self, ValueTypeArg::F32 | ValueTypeArg::F16)
+    }
+
+    /// Packed layouts (DotPacking8, blocked) score with dot product only.
+    fn is_dot_product_only(&self) -> bool {
+        self.is_packed()
+    }
+
+    /// Packed layouts with no `u32` encoding.
+    fn is_u16_only(&self) -> bool {
+        self.is_packed()
+            && !matches!(
+                self,
+                ValueTypeArg::Dotpacking8Scalaru8 | ValueTypeArg::Dotpacking8Scalaru16
+            )
+    }
+
+    fn is_packed(&self) -> bool {
+        !matches!(
+            self,
+            ValueTypeArg::F16
+                | ValueTypeArg::F32
+                | ValueTypeArg::Fixedu8
+                | ValueTypeArg::Fixedu16
+                | ValueTypeArg::Scalaru8
+                | ValueTypeArg::Scalaru16
+        )
+    }
 }
 
 impl std::fmt::Display for ValueTypeArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ValueTypeArg::F16 => write!(f, "f16"),
-            ValueTypeArg::F32 => write!(f, "f32"),
-            ValueTypeArg::Fixedu8 => write!(f, "fixedu8"),
-            ValueTypeArg::Fixedu16 => write!(f, "fixedu16"),
-        }
+        let value = self
+            .to_possible_value()
+            .expect("no value type is skipped by clap");
+        write!(f, "{}", value.get_name())
+    }
+}
+
+/// `dotvbyte` was removed in vectorium 0.11. Name its replacement instead of letting clap reject
+/// the value with its generic "invalid value" message.
+fn reject_removed_names() {
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "dotvbyte" || a.ends_with("=dotvbyte"))
+    {
+        eprintln!(
+            "Error: 'dotvbyte': DotVByte was removed in vectorium 0.11; use '--value-type dotpacking8-fixedu8'."
+        );
+        std::process::exit(2);
     }
 }
 
 /// Encoder type.
 /// Dense: `plain`, `pq`, `rabitq`, `rabitq-ext`.
-/// Sparse: `plain`, `dotvbyte`.
+/// Sparse: `plain` (`--value-type` selects the representation).
 #[derive(Debug, Clone, ValueEnum, Default)]
 enum EncoderType {
     #[default]
     Plain,
     Pq,
-    Dotvbyte,
     /// RaBitQ: 1-bit-per-component document codes, `--query-bits` per query component.
     Rabitq,
     /// Extended RaBitQ: multi-bit document codes. The code width is stored in the index.
@@ -73,7 +147,6 @@ impl std::fmt::Display for EncoderType {
         match self {
             EncoderType::Plain => write!(f, "plain"),
             EncoderType::Pq => write!(f, "pq"),
-            EncoderType::Dotvbyte => write!(f, "dotvbyte"),
             EncoderType::Rabitq => write!(f, "rabitq"),
             EncoderType::RabitqExt => write!(f, "rabitq-ext"),
         }
@@ -155,19 +228,21 @@ struct Args {
     #[clap(long, value_enum)]
     dataset_type: DatasetType,
 
-    /// Value type for stored values. Dense plain: f32, f16. Sparse plain: f32, f16, fixedu8, fixedu16.
-    /// Ignored for dotvbyte and pq.
+    /// Value type for stored values. Dense plain: f32, f16. Sparse: f32, f16, fixedu8, fixedu16,
+    /// scalaru8, scalaru16, blocked-sparse[-scalaru8|-scalaru16], dotpacking8-{fixedu8, scalaru8,
+    /// scalaru16, f16, scalar4bit}. Ignored for pq and rabitq. Must match the build.
     #[clap(long = "value-type", value_enum)]
     #[arg(default_value_t = ValueTypeArg::F32)]
     value_type: ValueTypeArg,
 
     /// Component type for sparse datasets (`u16` or `u32`).
-    /// DotVByte currently supports only `u16`.
+    /// Blocked and DotPacking8 value types support only `u16`, except dotpacking8-scalaru8 and
+    /// dotpacking8-scalaru16.
     #[clap(long = "component-type", value_enum)]
     #[arg(default_value_t = ComponentTypeArg::U16)]
     component_type: ComponentTypeArg,
 
-    /// Encoder type. Dense: plain, pq, rabitq, rabitq-ext. Sparse: plain, dotvbyte.
+    /// Encoder type. Dense: plain, pq, rabitq, rabitq-ext. Sparse: plain.
     #[clap(long, value_enum)]
     #[arg(default_value_t = EncoderType::Plain)]
     encoder: EncoderType,
@@ -222,9 +297,11 @@ struct Args {
 }
 
 fn main() {
+    reject_removed_names();
     let args: Args = Args::parse();
+    let metric = parse_metric(&args.distance);
 
-    // Cross-validation of encoder / dataset-type combinations
+    // Cross-validation of encoder / dataset-type / value-type combinations
     match (&args.dataset_type, &args.encoder) {
         (DatasetType::Sparse, EncoderType::Pq) => {
             eprintln!("Error: PQ encoder is only available for dense vectors.");
@@ -234,33 +311,39 @@ fn main() {
             eprintln!("Error: RaBitQ encoders are only available for dense vectors.");
             std::process::exit(1);
         }
-        (DatasetType::Dense, EncoderType::Dotvbyte) => {
-            eprintln!("Error: DotVByte encoder is only available for sparse vectors.");
-            std::process::exit(1);
-        }
-        (DatasetType::Dense, EncoderType::Plain)
-            if matches!(
-                args.value_type,
-                ValueTypeArg::Fixedu8 | ValueTypeArg::Fixedu16
-            ) =>
-        {
-            eprintln!("Error: fixedu8/fixedu16 value types are only available for sparse vectors.");
+        (DatasetType::Dense, EncoderType::Plain) if !args.value_type.is_dense() => {
+            eprintln!(
+                "Error: value type {} is only available for sparse vectors.",
+                args.value_type
+            );
             std::process::exit(1);
         }
         (DatasetType::Dense, _) if !matches!(args.component_type, ComponentTypeArg::U16) => {
             eprintln!("Error: component-type is only applicable to sparse datasets.");
             std::process::exit(1);
         }
-        (DatasetType::Sparse, EncoderType::Dotvbyte)
-            if !matches!(args.component_type, ComponentTypeArg::U16) =>
+        (DatasetType::Sparse, _)
+            if args.value_type.is_u16_only()
+                && !matches!(args.component_type, ComponentTypeArg::U16) =>
         {
-            eprintln!("Error: DotVByte encoder supports only component-type u16.");
+            eprintln!(
+                "Error: value type {} supports only component-type u16.",
+                args.value_type
+            );
+            std::process::exit(1);
+        }
+        (DatasetType::Sparse, _)
+            if args.value_type.is_dot_product_only()
+                && !matches!(metric, DistanceKind::DotProduct) =>
+        {
+            eprintln!(
+                "Error: value type {} supports only dotproduct distance.",
+                args.value_type
+            );
             std::process::exit(1);
         }
         _ => {}
     }
-
-    let metric = parse_metric(&args.distance);
 
     match (
         &args.dataset_type,
@@ -333,111 +416,11 @@ fn main() {
         (DatasetType::Dense, EncoderType::RabitqExt, _, GraphType::Streamvbyte) => {
             search_dense_rabitq_ext::<Graph<StreamVByteNeighbors>>(&args, metric);
         }
-        // Sparse plain f16
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::F16,
-            GraphType::Standard | GraphType::Permuted,
-        ) => {
-            search_sparse_plain_f16::<Graph<PlainNeighbors>>(&args, metric);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F16, GraphType::FixedDegree) => {
-            search_sparse_plain_f16::<GraphFixedDegree>(&args, metric);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F16, GraphType::Streamvbyte) => {
-            search_sparse_plain_f16::<Graph<StreamVByteNeighbors>>(&args, metric);
-        }
-        // Sparse plain f32
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::F32,
-            GraphType::Standard | GraphType::Permuted,
-        ) => {
-            search_sparse_plain_f32::<Graph<PlainNeighbors>>(&args, metric);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F32, GraphType::FixedDegree) => {
-            search_sparse_plain_f32::<GraphFixedDegree>(&args, metric);
-        }
-        (DatasetType::Sparse, EncoderType::Plain, ValueTypeArg::F32, GraphType::Streamvbyte) => {
-            search_sparse_plain_f32::<Graph<StreamVByteNeighbors>>(&args, metric);
-        }
-        // Sparse plain fixedu8
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu8,
-            GraphType::Standard | GraphType::Permuted,
-        ) => {
-            search_sparse_scalar::<FixedU8Q, Graph<PlainNeighbors>>(&args, metric);
-        }
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu8,
-            GraphType::FixedDegree,
-        ) => {
-            search_sparse_scalar::<FixedU8Q, GraphFixedDegree>(&args, metric);
-        }
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu8,
-            GraphType::Streamvbyte,
-        ) => {
-            search_sparse_scalar::<FixedU8Q, Graph<StreamVByteNeighbors>>(&args, metric);
-        }
-        // Sparse plain fixedu16
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu16,
-            GraphType::Standard | GraphType::Permuted,
-        ) => {
-            search_sparse_scalar::<FixedU16Q, Graph<PlainNeighbors>>(&args, metric);
-        }
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu16,
-            GraphType::FixedDegree,
-        ) => {
-            search_sparse_scalar::<FixedU16Q, GraphFixedDegree>(&args, metric);
-        }
-        (
-            DatasetType::Sparse,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu16,
-            GraphType::Streamvbyte,
-        ) => {
-            search_sparse_scalar::<FixedU16Q, Graph<StreamVByteNeighbors>>(&args, metric);
-        }
-        // Sparse dotvbyte (value-type ignored)
-        (
-            DatasetType::Sparse,
-            EncoderType::Dotvbyte,
-            _,
-            GraphType::Standard | GraphType::Permuted,
-        ) => {
-            search_sparse_dotvbyte::<Graph<PlainNeighbors>>(&args, metric);
-        }
-        (DatasetType::Sparse, EncoderType::Dotvbyte, _, GraphType::FixedDegree) => {
-            search_sparse_dotvbyte::<GraphFixedDegree>(&args, metric);
-        }
-        (DatasetType::Sparse, EncoderType::Dotvbyte, _, GraphType::Streamvbyte) => {
-            search_sparse_dotvbyte::<Graph<StreamVByteNeighbors>>(&args, metric);
-        }
+        (DatasetType::Sparse, EncoderType::Plain, _, _) => search_sparse(&args, metric),
         // Unreachable: caught by earlier validation
-        (DatasetType::Dense, EncoderType::Dotvbyte, _, _)
-        | (DatasetType::Sparse, EncoderType::Pq, _, _)
+        (DatasetType::Sparse, EncoderType::Pq, _, _)
         | (DatasetType::Sparse, EncoderType::Rabitq | EncoderType::RabitqExt, _, _)
-        | (
-            DatasetType::Dense,
-            EncoderType::Plain,
-            ValueTypeArg::Fixedu8 | ValueTypeArg::Fixedu16,
-            _,
-        ) => {
+        | (DatasetType::Dense, EncoderType::Plain, _, _) => {
             unreachable!()
         }
     }
@@ -957,253 +940,120 @@ where
     }
 }
 
-fn search_sparse_plain_f16<G>(args: &Args, metric: DistanceKind)
-where
-    G: GraphBound,
-{
-    match args.component_type {
-        ComponentTypeArg::U16 => search_sparse_plain_f16_with_component::<u16, G>(args, metric),
-        ComponentTypeArg::U32 => search_sparse_plain_f16_with_component::<u32, G>(args, metric),
-    }
-}
-
-fn search_sparse_plain_f16_with_component<C, G>(args: &Args, metric: DistanceKind)
-where
-    C: vectorium::ComponentType
-        + num_traits::FromPrimitive
-        + vectorium::SpaceUsage
-        + for<'de> serde::Deserialize<'de>,
-    G: GraphBound,
-{
-    match metric {
-        DistanceKind::Euclidean => {
-            search_sparse_plain_f16_with_distance::<C, SquaredEuclideanDistance, G>(args)
+/// Runs `$body` with `$c` and `$d` bound, as type aliases, to the `--component-type` and the
+/// distance, so that one generic call covers the four (component type, distance) pairs.
+macro_rules! with_component_and_distance {
+    ($args:expr, $distance:expr, |$c:ident, $d:ident| $body:expr) => {
+        match (&$args.component_type, $distance) {
+            (ComponentTypeArg::U16, DistanceKind::DotProduct) => {
+                type $c = u16;
+                type $d = DotProduct;
+                $body
+            }
+            (ComponentTypeArg::U16, DistanceKind::Euclidean) => {
+                type $c = u16;
+                type $d = SquaredEuclideanDistance;
+                $body
+            }
+            (ComponentTypeArg::U32, DistanceKind::DotProduct) => {
+                type $c = u32;
+                type $d = DotProduct;
+                $body
+            }
+            (ComponentTypeArg::U32, DistanceKind::Euclidean) => {
+                type $c = u32;
+                type $d = SquaredEuclideanDistance;
+                $body
+            }
         }
-        DistanceKind::DotProduct => search_sparse_plain_f16_with_distance::<C, DotProduct, G>(args),
-    }
+    };
 }
 
-fn search_sparse_plain_f16_with_distance<C, D, G>(args: &Args)
-where
-    C: vectorium::ComponentType
-        + num_traits::FromPrimitive
-        + vectorium::SpaceUsage
-        + for<'de> serde::Deserialize<'de>,
-    D: ScalarSparseSupportedDistance + Distance,
-    G: GraphBound,
-{
-    let config = create_search_config(args);
-    let queries: PlainSparseDataset<C, f32, D> = read_seismic_format(&args.query_file)
-        .unwrap_or_else(|e| {
-            eprintln!("Error reading query file: {e:?}");
-            std::process::exit(1);
-        });
-    let num_queries = queries.len();
-    let index: HNSW<PlainSparseDataset<C, f16, D>, G> =
-        <HNSW<PlainSparseDataset<C, f16, D>, G> as IndexSerializer>::load_index(&args.index_file)
-            .unwrap();
-
-    let mut total_time_search = 0u128;
-    let mut results = Vec::<(f32, usize)>::with_capacity(num_queries * args.k);
-
-    for _ in 0..args.num_runs {
-        for query in queries.iter() {
-            let start_time = Instant::now();
-            let res = index.search(query, args.k, &config);
-            results.extend(
-                res.into_iter()
-                    .map(|scored| (scored.distance.distance(), scored.vector as usize)),
-            );
-            total_time_search += start_time.elapsed().as_micros();
+/// Sparse datasets: picks the stored dataset type from `--value-type`, `--component-type` and the
+/// distance. Value types that are dot-product-only or `u16`-only were validated in `main`.
+fn search_sparse(args: &Args, metric: DistanceKind) {
+    let u32_components = matches!(args.component_type, ComponentTypeArg::U32);
+    match args.value_type {
+        ValueTypeArg::F32 => with_component_and_distance!(args, metric, |C, D| {
+            search_sparse_with::<C, D, PlainSparseDataset<C, f32, D>>(args)
+        }),
+        ValueTypeArg::F16 => with_component_and_distance!(args, metric, |C, D| {
+            search_sparse_with::<C, D, PlainSparseDataset<C, f16, D>>(args)
+        }),
+        ValueTypeArg::Fixedu8 => with_component_and_distance!(args, metric, |C, D| {
+            search_sparse_with::<C, D, ScalarSparseDataset<C, f32, FixedU8Q, D>>(args)
+        }),
+        ValueTypeArg::Fixedu16 => with_component_and_distance!(args, metric, |C, D| {
+            search_sparse_with::<C, D, ScalarSparseDataset<C, f32, FixedU16Q, D>>(args)
+        }),
+        ValueTypeArg::Scalaru8 => with_component_and_distance!(args, metric, |C, D| {
+            search_sparse_with::<C, D, ScalarU8SparseDataset<C, D>>(args)
+        }),
+        ValueTypeArg::Scalaru16 => with_component_and_distance!(args, metric, |C, D| {
+            search_sparse_with::<C, D, ScalarU16SparseDataset<C, D>>(args)
+        }),
+        ValueTypeArg::BlockedSparse => {
+            search_sparse_with::<u16, DotProduct, BlockedSparseDataset>(args)
         }
-    }
-
-    let avg_time_search_per_query = total_time_search / (num_queries * args.num_runs) as u128;
-    println!("[######] Average Query Time: {avg_time_search_per_query} μs");
-
-    index.print_space_usage_bytes();
-
-    if let Some(output_path) = &args.output_path {
-        write_results_to_file(output_path, &results, args.k);
-    }
-}
-
-fn search_sparse_plain_f32<G>(args: &Args, metric: DistanceKind)
-where
-    G: GraphBound,
-{
-    match args.component_type {
-        ComponentTypeArg::U16 => search_sparse_plain_f32_with_component::<u16, G>(args, metric),
-        ComponentTypeArg::U32 => search_sparse_plain_f32_with_component::<u32, G>(args, metric),
-    }
-}
-
-fn search_sparse_plain_f32_with_component<C, G>(args: &Args, metric: DistanceKind)
-where
-    C: vectorium::ComponentType
-        + num_traits::FromPrimitive
-        + vectorium::SpaceUsage
-        + for<'de> serde::Deserialize<'de>,
-    G: GraphBound,
-{
-    match metric {
-        DistanceKind::Euclidean => {
-            search_sparse_plain_f32_with_distance::<C, SquaredEuclideanDistance, G>(args)
+        ValueTypeArg::BlockedSparseScalaru8 => {
+            search_sparse_with::<u16, DotProduct, BlockedSparseScalarU8Dataset>(args)
         }
-        DistanceKind::DotProduct => search_sparse_plain_f32_with_distance::<C, DotProduct, G>(args),
-    }
-}
-
-fn search_sparse_plain_f32_with_distance<C, D, G>(args: &Args)
-where
-    C: vectorium::ComponentType
-        + num_traits::FromPrimitive
-        + vectorium::SpaceUsage
-        + for<'de> serde::Deserialize<'de>,
-    D: ScalarSparseSupportedDistance + Distance,
-    G: GraphBound,
-{
-    let config = create_search_config(args);
-    let queries: PlainSparseDataset<C, f32, D> = read_seismic_format(&args.query_file)
-        .unwrap_or_else(|e| {
-            eprintln!("Error reading query file: {e:?}");
-            std::process::exit(1);
-        });
-    let num_queries = queries.len();
-    let index: HNSW<PlainSparseDataset<C, f32, D>, G> =
-        <HNSW<PlainSparseDataset<C, f32, D>, G> as IndexSerializer>::load_index(&args.index_file)
-            .unwrap();
-
-    let mut total_time_search = 0u128;
-    let mut results = Vec::<(f32, usize)>::with_capacity(num_queries * args.k);
-
-    for _ in 0..args.num_runs {
-        for query in queries.iter() {
-            let start_time = Instant::now();
-            let res = index.search(query, args.k, &config);
-            results.extend(
-                res.into_iter()
-                    .map(|scored| (scored.distance.distance(), scored.vector as usize)),
-            );
-            total_time_search += start_time.elapsed().as_micros();
+        ValueTypeArg::BlockedSparseScalaru16 => {
+            search_sparse_with::<u16, DotProduct, BlockedSparseScalarU16Dataset>(args)
+        }
+        ValueTypeArg::Dotpacking8Fixedu8 => {
+            search_sparse_with::<u16, DotProduct, DotPacking8U16FixedU8Dataset>(args)
+        }
+        ValueTypeArg::Dotpacking8Scalaru8 if u32_components => {
+            search_sparse_with::<u32, DotProduct, BridgedDotPacking8U32ScalarU8Dataset>(args)
+        }
+        ValueTypeArg::Dotpacking8Scalaru8 => {
+            search_sparse_with::<u16, DotProduct, DotPacking8U16ScalarU8Dataset>(args)
+        }
+        ValueTypeArg::Dotpacking8Scalaru16 if u32_components => {
+            search_sparse_with::<u32, DotProduct, BridgedDotPacking8U32ScalarU16Dataset>(args)
+        }
+        ValueTypeArg::Dotpacking8Scalaru16 => {
+            search_sparse_with::<u16, DotProduct, DotPacking8U16ScalarU16Dataset>(args)
+        }
+        ValueTypeArg::Dotpacking8F16 => {
+            search_sparse_with::<u16, DotProduct, DotPacking8U16F16Dataset>(args)
+        }
+        ValueTypeArg::Dotpacking8Scalar4bit => {
+            search_sparse_with::<u16, DotProduct, DotPacking8U16Scalar4BitDataset>(args)
         }
     }
-
-    let avg_time_search_per_query = total_time_search / (num_queries * args.num_runs) as u128;
-    println!("[######] Average Query Time: {avg_time_search_per_query} μs");
-
-    index.print_space_usage_bytes();
-
-    if let Some(output_path) = &args.output_path {
-        write_results_to_file(output_path, &results, args.k);
-    }
 }
 
-// --- DotVByte (encoder = dotvbyte, DotProduct only) ---
-
-fn search_sparse_dotvbyte<G>(args: &Args, metric: DistanceKind)
+/// Picks the graph type. `permuted` loads as the same Rust type as `standard`.
+fn search_sparse_with<C, D, Ds>(args: &Args)
 where
-    G: GraphBound,
+    C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage,
+    D: ScalarSparseSupportedDistance,
+    Ds: Dataset + Sync + SpaceUsage + for<'de> serde::Deserialize<'de>,
+    Ds::Encoder:
+        for<'q> VectorEncoder<QueryVector<'q> = SparseVectorView<'q, C, f32>, QueryParams = ()>,
+    <Ds::Encoder as VectorEncoder>::Distance: Distance,
 {
-    match metric {
-        DistanceKind::Euclidean => {
-            eprintln!("Error: DotVByte encoder only supports dotproduct distance.");
-            std::process::exit(1);
+    match args.graph_type {
+        GraphType::Standard | GraphType::Permuted => {
+            search_sparse_index::<C, D, Ds, Graph<PlainNeighbors>>(args)
         }
-        DistanceKind::DotProduct => search_sparse_dotvbyte_dp::<G>(args),
-    }
-}
-
-fn search_sparse_dotvbyte_dp<G>(args: &Args)
-where
-    G: GraphBound,
-{
-    let config = create_search_config(args);
-    let queries: PlainSparseDataset<u16, f32, DotProduct> = read_seismic_format(&args.query_file)
-        .unwrap_or_else(|e| {
-            eprintln!("Error reading query file: {e:?}");
-            std::process::exit(1);
-        });
-    let num_queries = queries.len();
-
-    let index: HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, G> =
-        <HNSW<PackedSparseDataset<DotVByteFixedU8Encoder>, G> as IndexSerializer>::load_index(
-            &args.index_file,
-        )
-        .unwrap();
-
-    let mut total_time_search = 0u128;
-    let mut results = Vec::<(f32, usize)>::with_capacity(num_queries * args.k);
-
-    for _ in 0..args.num_runs {
-        for query in queries.iter() {
-            let start_time = Instant::now();
-            let res = index.search(query, args.k, &config);
-            results.extend(
-                res.into_iter()
-                    .map(|scored| (scored.distance.distance(), scored.vector as usize)),
-            );
-            total_time_search += start_time.elapsed().as_micros();
+        GraphType::FixedDegree => search_sparse_index::<C, D, Ds, GraphFixedDegree>(args),
+        GraphType::Streamvbyte => {
+            search_sparse_index::<C, D, Ds, Graph<StreamVByteNeighbors>>(args)
         }
     }
-
-    let avg_time_search_per_query = total_time_search / (num_queries * args.num_runs) as u128;
-    println!("[######] Average Query Time: {avg_time_search_per_query} μs");
-    index.print_space_usage_bytes();
-
-    if let Some(output_path) = &args.output_path {
-        write_results_to_file(output_path, &results, args.k);
-    }
 }
 
-fn search_sparse_scalar<V, G>(args: &Args, metric: DistanceKind)
+fn search_sparse_index<C, D, Ds, G>(args: &Args)
 where
-    V: vectorium::ValueType
-        + vectorium::Float
-        + vectorium::FromF32
-        + vectorium::SpaceUsage
-        + for<'de> serde::Deserialize<'de>,
-    G: GraphBound,
-{
-    match args.component_type {
-        ComponentTypeArg::U16 => search_sparse_scalar_with_component::<u16, V, G>(args, metric),
-        ComponentTypeArg::U32 => search_sparse_scalar_with_component::<u32, V, G>(args, metric),
-    }
-}
-
-fn search_sparse_scalar_with_component<C, V, G>(args: &Args, metric: DistanceKind)
-where
-    C: vectorium::ComponentType
-        + num_traits::FromPrimitive
-        + vectorium::SpaceUsage
-        + for<'de> serde::Deserialize<'de>,
-    V: vectorium::ValueType
-        + vectorium::Float
-        + vectorium::FromF32
-        + vectorium::SpaceUsage
-        + for<'de> serde::Deserialize<'de>,
-    G: GraphBound,
-{
-    match metric {
-        DistanceKind::Euclidean => {
-            search_sparse_scalar_with_distance::<C, V, SquaredEuclideanDistance, G>(args)
-        }
-        DistanceKind::DotProduct => search_sparse_scalar_with_distance::<C, V, DotProduct, G>(args),
-    }
-}
-
-fn search_sparse_scalar_with_distance<C, V, D, G>(args: &Args)
-where
-    C: vectorium::ComponentType
-        + num_traits::FromPrimitive
-        + vectorium::SpaceUsage
-        + for<'de> serde::Deserialize<'de>,
-    V: vectorium::ValueType
-        + vectorium::Float
-        + vectorium::FromF32
-        + vectorium::SpaceUsage
-        + for<'de> serde::Deserialize<'de>,
-    D: ScalarSparseSupportedDistance + Distance,
+    C: vectorium::ComponentType + num_traits::FromPrimitive + SpaceUsage,
+    D: ScalarSparseSupportedDistance,
+    Ds: Dataset + Sync + SpaceUsage + for<'de> serde::Deserialize<'de>,
+    Ds::Encoder:
+        for<'q> VectorEncoder<QueryVector<'q> = SparseVectorView<'q, C, f32>, QueryParams = ()>,
+    <Ds::Encoder as VectorEncoder>::Distance: Distance,
     G: GraphBound,
 {
     let config = create_search_config(args);
@@ -1214,11 +1064,8 @@ where
         });
     let num_queries = queries.len();
 
-    let index: HNSW<ScalarSparseDataset<C, f32, V, D>, G> =
-        <HNSW<ScalarSparseDataset<C, f32, V, D>, G> as IndexSerializer>::load_index(
-            &args.index_file,
-        )
-        .unwrap();
+    let index: HNSW<Ds, G> =
+        <HNSW<Ds, G> as IndexSerializer>::load_index(&args.index_file).unwrap();
 
     let mut total_time_search = 0u128;
     let mut results = Vec::<(f32, usize)>::with_capacity(num_queries * args.k);

@@ -18,7 +18,7 @@ mod rerank;
 
 pub use flat::{DenseFlatIndex, SparseFlatIndex};
 pub use hnsw::{
-    DensePQHNSW, DensePlainHNSW, SparseDotVByteHNSW, SparseFixedU8HNSW, SparseFixedU16HNSW,
+    DensePQHNSW, DensePlainHNSW, SparseDotPacking8HNSW, SparseFixedU8HNSW, SparseFixedU16HNSW,
     SparsePlainHNSW,
 };
 pub use rerank::{DenseRerankHNSW, SparseRerankHNSW};

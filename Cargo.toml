@@ -1,6 +1,6 @@
 [package]
 name = "kannolo"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 license = "MIT"
 description = "kANNolo is designed for easy prototyping of ANN Search algorithms while ensuring high effectiveness and efficiency over both dense and sparse vectors."
@@ -20,7 +20,7 @@ rayon       = "1.10.0"
 bincode     = "2.0.1"
 rustc-hash  = "2.1.0"
 tantivy-bitpacker = "0.8.0"
-vectorium   = { git = "https://github.com/TusKANNy/vectorium.git", tag = "v0.10.0" }
+vectorium   = { git = "https://github.com/TusKANNy/vectorium.git", tag = "v0.11.1" }
 indicatif   = { version = "0.18.3", features = ["rayon"] }
 postcard    = { version = "1", features = ["alloc"] }
 rgb         = { package = "rgbisect", version = "0.1.0" }

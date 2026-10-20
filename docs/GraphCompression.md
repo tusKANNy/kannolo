@@ -60,11 +60,11 @@ Search it:
   --distance dotproduct --k 10 --ef-search 40
 ```
 
-`permuted` and `streamvbyte` are supported for every dataset/encoder combination documented in [Binaries.md](Binaries.md) (dense plain, dense PQ, sparse plain, sparse DotVByte, sparse scalar).
+`permuted` and `streamvbyte` are supported for every dataset/encoder combination documented in [Binaries.md](Binaries.md) (dense plain, dense PQ, dense RaBitQ, and every sparse value type).
 
 ## Python Usage
 
-The `graph_type` keyword is available on `build_from_file`, `build_from_array`/`build_from_arrays`, and `load` for every HNSW-backed class: `DensePlainHNSW`, `DensePQHNSW`, `SparsePlainHNSW`, `SparseDotVByteHNSW`, `SparseFixedU8HNSW`, `SparseFixedU16HNSW`. It is not available on the flat (brute-force) or multivector reranking indexes, since they have no HNSW graph to compress.
+The `graph_type` keyword is available on `build_from_file`, `build_from_array`/`build_from_arrays`, and `load` for every HNSW-backed class: `DensePlainHNSW`, `DensePQHNSW`, `SparsePlainHNSW`, `SparseDotPacking8HNSW`, `SparseFixedU8HNSW`, `SparseFixedU16HNSW`. It is not available on the flat (brute-force) or multivector reranking indexes, since they have no HNSW graph to compress.
 
 **You can ignore it entirely.** Omitting it gives you `"standard"`, the plain uncompressed index:
 

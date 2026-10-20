@@ -79,9 +79,9 @@ The TOML configuration files have been updated to work with the unified binaries
 - `build-command`: Path to the unified build binary (e.g., `"./target/release/hnsw_build"`)
 - `query-command`: Path to the unified search binary (e.g., `"./target/release/hnsw_search"`)
 - `dataset-type`: Type of vectors - `"dense"` or `"sparse"` (multivector is no longer supported)
-- `value-type`: Value type - `"f32"`, `"f16"`, `"fixedu8"`, or `"fixedu16"` (for `encoder = "pq"` and `encoder = "dotvbyte"`, this is ignored)
-- `component-type`: Sparse-only component type - `"u16"` or `"u32"` (DotVByte requires `"u16"`)
-- `encoder`: Encoder type - `"plain"`, `"pq"`, or `"dotvbyte"` (`pq` is dense-only, `dotvbyte` is sparse-only)
+- `value-type`: Value type - `"f32"` or `"f16"` for dense; for sparse also `"fixedu8"`, `"fixedu16"`, `"scalaru8"`, `"scalaru16"`, the blocked and the DotPacking8 types (e.g. `"dotpacking8-fixedu8"`, which replaces the removed `"dotvbyte"` encoder). See [Binaries.md](Binaries.md#sparse-value-types). Ignored for `encoder = "pq"`.
+- `component-type`: Sparse-only component type - `"u16"` or `"u32"` (blocked and most DotPacking8 value types require `"u16"`)
+- `encoder`: Encoder type - `"plain"`, `"pq"`, `"rabitq"` or `"rabitq-ext"` (all but `plain` are dense-only)
 - `graph-type`: Graph type - `"standard"`, `"fixed-degree"`, `"permuted"`, or `"streamvbyte"`. `"permuted"` reorders the graph for faster queries at the same size; `"streamvbyte"` also compresses it, requires `m <= 128`, and roughly halves the graph portion of the index. All produce identical results. See [GraphCompression.md](GraphCompression.md)
 
 `graph-type` may also be set **per query subsection**, overriding the top-level value. Because

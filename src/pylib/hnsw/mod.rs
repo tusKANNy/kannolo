@@ -3,14 +3,14 @@
 
 mod dense_plain;
 mod dense_pq;
-mod sparse_dotvbyte;
+mod sparse_dotpacking8;
 mod sparse_fixed_u16;
 mod sparse_fixed_u8;
 mod sparse_plain;
 
 pub use dense_plain::DensePlainHNSW;
 pub use dense_pq::DensePQHNSW;
-pub use sparse_dotvbyte::SparseDotVByteHNSW;
+pub use sparse_dotpacking8::SparseDotPacking8HNSW;
 pub use sparse_fixed_u8::SparseFixedU8HNSW;
 pub use sparse_fixed_u16::SparseFixedU16HNSW;
 pub use sparse_plain::SparsePlainHNSW;
