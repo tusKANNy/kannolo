@@ -28,6 +28,8 @@ use vectorium::{Dataset, Index, PlainSparseDataset};
 enum ValueTypeArg {
     F16,
     Fixedu8,
+    #[value(name = "blocked-sparse")]
+    BlockedSparse,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -62,7 +64,7 @@ struct Args {
     #[clap(long, action)]
     residual_rerank: bool,
 
-    #[clap(long, value_enum, default_value_t = ValueTypeArg::F16)]
+    #[clap(long, value_enum, default_value_t = ValueTypeArg::BlockedSparse)]
     first_stage_value_type: ValueTypeArg,
 
     /// `standard` and `permuted` load as the same type.
@@ -131,6 +133,7 @@ fn main() {
         match args.first_stage_value_type {
             ValueTypeArg::F16 => SparseFirstStage::F16,
             ValueTypeArg::Fixedu8 => SparseFirstStage::FixedU8,
+            ValueTypeArg::BlockedSparse => SparseFirstStage::Blocked,
         },
         match args.graph_type {
             GraphTypeArg::Standard => GraphLayout::Standard,

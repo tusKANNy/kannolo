@@ -182,47 +182,52 @@ mod tests {
             vectors.push((comps, vals));
         }
         let collection: PlainSparseDataset<u16, f32, DotProduct> = growable.into();
-        let mut cfg = SparseRerankConfig::l1_pruned(60.0);
-        cfg.m = 8;
-        cfg.ef_construction = 50;
-        let index = SparseRerankIndex::build(collection, &cfg).unwrap();
+        for first_stage in [SparseFirstStage::Blocked, SparseFirstStage::F16] {
+            let mut cfg = SparseRerankConfig::l1_pruned(60.0);
+            cfg.first_stage = first_stage;
+            cfg.m = 8;
+            cfg.ef_construction = 50;
+            let index = SparseRerankIndex::build(collection.clone(), &cfg).unwrap();
 
-        assert_eq!(index.n_elements(), n);
-        assert_eq!(IndexStats::dim(&index), dim);
+            assert_eq!(index.n_elements(), n);
+            assert_eq!(IndexStats::dim(&index), dim);
 
-        // Residual reranking scores every candidate exactly, so with every vector a candidate the
-        // top result for a stored vector is the stored vector with the largest dot product.
-        let params = RerankSearchParams::new(n, n);
-        let (comps, vals) = &vectors[42];
-        let query = SparseVectorView::new(comps.as_slice(), vals.as_slice());
-        let exact = |(c, v): &(Vec<u16>, Vec<f32>)| -> f32 {
-            c.iter()
-                .zip(v)
-                .filter_map(|(ci, vi)| comps.binary_search(ci).ok().map(|p| vi * vals[p]))
-                .sum()
-        };
-        let best = (0..n)
-            .max_by(|&a, &b| exact(&vectors[a]).total_cmp(&exact(&vectors[b])))
+            // Residual reranking scores every candidate exactly, so with every vector a candidate the
+            // top result for a stored vector is the stored vector with the largest dot product.
+            let params = RerankSearchParams::new(n, n);
+            let (comps, vals) = &vectors[42];
+            let query = SparseVectorView::new(comps.as_slice(), vals.as_slice());
+            let exact = |(c, v): &(Vec<u16>, Vec<f32>)| -> f32 {
+                c.iter()
+                    .zip(v)
+                    .filter_map(|(ci, vi)| comps.binary_search(ci).ok().map(|p| vi * vals[p]))
+                    .sum()
+            };
+            let best = (0..n)
+                .max_by(|&a, &b| exact(&vectors[a]).total_cmp(&exact(&vectors[b])))
+                .unwrap();
+            assert_eq!(top1(&index, query, &params), best);
+
+            let path = std::env::temp_dir().join(format!(
+                "kannolo_sparse_rerank_{}_{first_stage:?}.bin",
+                std::process::id()
+            ));
+            index.save(path.to_str().unwrap()).unwrap();
+            let loaded = SparseRerankIndex::load(
+                path.to_str().unwrap(),
+                first_stage,
+                GraphLayout::Standard,
+                true,
+            )
             .unwrap();
-        assert_eq!(top1(&index, query, &params), best);
-
-        let path =
-            std::env::temp_dir().join(format!("kannolo_sparse_rerank_{}.bin", std::process::id()));
-        index.save(path.to_str().unwrap()).unwrap();
-        let loaded = SparseRerankIndex::load(
-            path.to_str().unwrap(),
-            SparseFirstStage::F16,
-            GraphLayout::Standard,
-            true,
-        )
-        .unwrap();
-        std::fs::remove_file(&path).unwrap();
-        let ids = |i: &SparseRerankIndex| -> Vec<u64> {
-            i.search(query, 10, &params)
-                .iter()
-                .map(|r| r.vector)
-                .collect()
-        };
-        assert_eq!(ids(&loaded), ids(&index));
+            std::fs::remove_file(&path).unwrap();
+            let ids = |i: &SparseRerankIndex| -> Vec<u64> {
+                i.search(query, 10, &params)
+                    .iter()
+                    .map(|r| r.vector)
+                    .collect()
+            };
+            assert_eq!(ids(&loaded), ids(&index));
+        }
     }
 }

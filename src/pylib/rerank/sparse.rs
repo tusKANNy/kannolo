@@ -16,7 +16,7 @@ use crate::rerank::{SparseFirstStage, SparseRerankConfig, SparseRerankIndex};
 use super::dense::{io_err, layout, search_params, value_err};
 use crate::pylib::common::{
     build_sparse_dataset_from_parts, check_same_len, convert_components_to_u16, offsets_to_usize,
-    push_results, validate_offsets,
+    push_results, sort_queries_by_component, validate_offsets,
 };
 use crate::pylib::hnsw::{parse_build_graph_type, parse_graph_type};
 
@@ -31,9 +31,10 @@ fn parse_first_stage(value_type: &str) -> PyResult<SparseFirstStage> {
     match value_type.to_lowercase().as_str() {
         "f16" => Ok(SparseFirstStage::F16),
         "fixedu8" | "u8" => Ok(SparseFirstStage::FixedU8),
+        "blocked-sparse" | "blocked" => Ok(SparseFirstStage::Blocked),
         other => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "unknown first_stage_value_type {other:?}; choose \"f16\" (the default) or \
-             \"fixedu8\". The rerank stage is always f16."
+            "unknown first_stage_value_type {other:?}; choose \"blocked-sparse\" (the \
+             default), \"f16\" or \"fixedu8\"."
         ))),
     }
 }
@@ -68,15 +69,17 @@ impl SparseRerankHNSW {
     /// * `prune_percentage` – in `[0, 100]`; the first stage keeps, per vector, the components
     ///   carrying the top `prune_percentage`% of its L1 mass. 100 means no pruning.
     /// * `m`, `ef_construction` – HNSW build parameters for the first stage.
-    /// * `first_stage_value_type` – `"f16"` (default) or `"fixedu8"`.
-    /// * `graph_type` – `"standard"` (default), `"permuted"` or `"compressed"`.
+    /// * `first_stage_value_type` – `"blocked-sparse"` (default; both stages stored blocked, the
+    ///   graph built over `f16` values), `"f16"` or `"fixedu8"`.
+    /// * `graph_type` – `"standard"` (default), `"permuted"` or `"compressed"` (the latter needs an
+    ///   `"f16"` or `"fixedu8"` first stage).
     /// * `residual_rerank` – store only the pruned-away components in the rerank stage and sum
     ///   the two scores. Needs `prune_percentage < 100`. Default: False.
     ///
-    /// `prune_percentage=100` with an `f16` first stage is rejected, since the rerank stage would
-    /// be an identical copy.
+    /// `prune_percentage=100` with a `"blocked-sparse"` or `"f16"` first stage is rejected, since
+    /// the rerank stage would be an identical copy.
     #[staticmethod]
-    #[pyo3(signature = (data_file, prune_percentage, m=32, ef_construction=200, first_stage_value_type="f16".to_string(), graph_type="standard".to_string(), residual_rerank=false))]
+    #[pyo3(signature = (data_file, prune_percentage, m=32, ef_construction=200, first_stage_value_type="blocked-sparse".to_string(), graph_type="standard".to_string(), residual_rerank=false))]
     pub fn build_from_file(
         data_file: &str,
         prune_percentage: f32,
@@ -107,7 +110,7 @@ impl SparseRerankHNSW {
     /// `n + 1` entries delimiting the `n` vectors. The other arguments are as for
     /// [`build_from_file`](Self::build_from_file).
     #[staticmethod]
-    #[pyo3(signature = (components, values, offsets, prune_percentage, m=32, ef_construction=200, first_stage_value_type="f16".to_string(), graph_type="standard".to_string(), residual_rerank=false))]
+    #[pyo3(signature = (components, values, offsets, prune_percentage, m=32, ef_construction=200, first_stage_value_type="blocked-sparse".to_string(), graph_type="standard".to_string(), residual_rerank=false))]
     #[allow(clippy::too_many_arguments)]
     pub fn build_from_arrays(
         components: PyReadonlyArray1<i32>,
@@ -159,7 +162,7 @@ impl SparseRerankHNSW {
     /// Index files carry no header, so `first_stage_value_type`, `graph_type` and
     /// `residual_rerank` must match the build. `"standard"` and `"permuted"` load as the same type.
     #[staticmethod]
-    #[pyo3(signature = (path, first_stage_value_type="f16".to_string(), graph_type="standard".to_string(), residual_rerank=false))]
+    #[pyo3(signature = (path, first_stage_value_type="blocked-sparse".to_string(), graph_type="standard".to_string(), residual_rerank=false))]
     pub fn load(
         path: &str,
         first_stage_value_type: String,
@@ -204,10 +207,11 @@ impl SparseRerankHNSW {
         early_exit_threshold: Option<f32>,
     ) -> PyResult<(Py<PyArray1<f32>>, Py<PyArray1<i64>>)> {
         let comp_vec = convert_components_to_u16(query_components.as_slice()?)?;
-        let values_slice = query_values.as_slice()?;
-        check_same_len(comp_vec.len(), values_slice.len())?;
+        let n = comp_vec.len();
+        let (comp_vec, values) =
+            sort_queries_by_component(comp_vec, query_values.as_slice()?, &[0, n])?;
         let params = search_params(k_candidates, ef_search, alpha, beta, early_exit_threshold);
-        let query = SparseVectorView::new(&comp_vec, values_slice);
+        let query = SparseVectorView::new(&comp_vec, &values);
 
         let mut distances = Vec::with_capacity(k);
         let mut ids = Vec::with_capacity(k);
@@ -253,6 +257,8 @@ impl SparseRerankHNSW {
         check_same_len(comp_vec.len(), values_slice.len())?;
         let offsets = offsets_to_usize(sparse_offsets.as_slice()?)?;
         validate_offsets(&offsets, values_slice.len())?;
+        let (comp_vec, values) = sort_queries_by_component(comp_vec, values_slice, &offsets)?;
+        let values_slice = values.as_slice();
         let params = search_params(k_candidates, ef_search, alpha, beta, early_exit_threshold);
         let num_queries = offsets.len() - 1;
 

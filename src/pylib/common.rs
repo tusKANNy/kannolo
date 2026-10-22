@@ -78,6 +78,31 @@ pub(super) fn convert_components_to_u16(components: &[i32]) -> PyResult<Vec<u16>
     Ok(out)
 }
 
+/// Sorts each query `[bounds[i], bounds[i + 1])` of a flattened batch by component, moving its
+/// values along. The blocked sparse kernel walks a short query in component order, and numpy
+/// input need not be sorted.
+pub(super) fn sort_queries_by_component(
+    mut components: Vec<u16>,
+    values: &[f32],
+    bounds: &[usize],
+) -> PyResult<(Vec<u16>, Vec<f32>)> {
+    check_same_len(components.len(), values.len())?;
+    let mut values = values.to_vec();
+    for w in bounds.windows(2) {
+        let (c, v) = (&mut components[w[0]..w[1]], &mut values[w[0]..w[1]]);
+        if c.is_sorted() {
+            continue;
+        }
+        let mut pairs: Vec<(u16, f32)> = c.iter().copied().zip(v.iter().copied()).collect();
+        pairs.sort_by_key(|p| p.0);
+        for (i, (ci, vi)) in pairs.into_iter().enumerate() {
+            c[i] = ci;
+            v[i] = vi;
+        }
+    }
+    Ok((components, values))
+}
+
 /// Rejects sparse components and values of different lengths.
 pub(super) fn check_same_len(components: usize, values: usize) -> PyResult<()> {
     if components != values {

@@ -28,7 +28,7 @@ Options:
   -d, --data-file <DATA_FILE>
   -o, --output-file <OUTPUT_FILE>
       --dataset-type <DATASET_TYPE>      [possible values: dense, sparse]
-      --value-type <VALUE_TYPE>          [default: f32] [possible values: see "Sparse value types" below]
+      --value-type <VALUE_TYPE>          [default: blocked-sparse for sparse, f32 for dense] [possible values: see "Sparse value types" below]
       --component-type <COMPONENT_TYPE>  [default: u16] [possible values: u16, u32]
       --encoder <ENCODER>                [default: plain] [possible values: plain, pq, rabitq, rabitq-ext]
       --graph-type <GRAPH_TYPE>          [default: standard] [possible values: standard, fixed-degree, permuted, streamvbyte]
@@ -54,7 +54,7 @@ Options:
   -q, --query-file <QUERY_FILE>
   -o, --output-path <OUTPUT_PATH>
       --dataset-type <DATASET_TYPE>      [possible values: dense, sparse]
-      --value-type <VALUE_TYPE>          [default: f32] [possible values: see "Sparse value types" below]
+      --value-type <VALUE_TYPE>          [default: blocked-sparse for sparse, f32 for dense] [possible values: see "Sparse value types" below]
       --component-type <COMPONENT_TYPE>  [default: u16] [possible values: u16, u32]
       --encoder <ENCODER>                [default: plain] [possible values: plain, pq, rabitq, rabitq-ext]
       --graph-type <GRAPH_TYPE>          [default: standard] [possible values: standard, fixed-degree, permuted, streamvbyte]
@@ -150,15 +150,17 @@ stage holds:
 
 - `--prune-percentage` below 100 L1-prunes the first stage to the components carrying that
   percentage of each vector's L1 mass.
-- `--first-stage-value-type` stores the first stage as `f16` or `fixedu8`. The rerank stage is
-  always `f16`.
+- `--first-stage-value-type` stores the first stage as `blocked-sparse` (the default), `f16` or
+  `fixedu8`. With `blocked-sparse` both stages are stored blocked and the graph is built over the
+  `f16` values; otherwise the rerank stage is `f16`. The `streamvbyte` graph needs `f16` or
+  `fixedu8`.
 - `--residual-rerank` stores only the pruned-away components in the rerank stage and sums the two
   scores; with an `f16` first stage this is the exact score at `f16` precision, and each non-zero
   is stored once.
   Without it the rerank stage holds the full vectors.
 
-No pruning with `--residual-rerank` (the residual would be empty) and no pruning with an `f16`
-first stage (the rerank stage would be an identical copy) are rejected.
+No pruning with `--residual-rerank` (the residual would be empty) and no pruning with a
+`blocked-sparse` or `f16` first stage (the rerank stage would be an identical copy) are rejected.
 
 ```bash
 Usage: hnsw_rerank_build_sparse [OPTIONS] --data-file <DATA_FILE> --output-file <OUTPUT_FILE>
@@ -168,7 +170,7 @@ Options:
   -o, --output-file <OUTPUT_FILE>
       --prune-percentage <PRUNE_PERCENTAGE>  required; 100 means no pruning
       --residual-rerank
-      --first-stage-value-type <TYPE>    [default: f16] [possible values: f16, fixedu8]
+      --first-stage-value-type <TYPE>    [default: blocked-sparse] [possible values: blocked-sparse, f16, fixedu8]
       --graph-type <GRAPH_TYPE>          [default: standard] [possible values: standard, permuted, streamvbyte]
       --m <M>                            [default: 32]
       --ef-construction <EF_CONSTRUCTION> [default: 200]
@@ -182,7 +184,7 @@ Options:
   -q, --query-file <QUERY_FILE>          Seismic binary format
   -o, --output-path <OUTPUT_PATH>
       --residual-rerank
-      --first-stage-value-type <TYPE>    [default: f16] [possible values: f16, fixedu8]
+      --first-stage-value-type <TYPE>    [default: blocked-sparse] [possible values: blocked-sparse, f16, fixedu8]
       --graph-type <GRAPH_TYPE>          [default: standard] [possible values: standard, permuted, streamvbyte]
   -k, --k <K>                            [default: 10]
       --k-candidates <K_CANDIDATES>      [default: 100]
@@ -321,6 +323,8 @@ IVF:
 ## Sparse value types
 
 For sparse datasets, `--value-type` selects how the dataset is stored (`--encoder` stays `plain`).
+Left out, it is `blocked-sparse`, which needs `dotproduct` and `u16` components; pass another value
+type (e.g. `f16`) for Euclidean distance or `u32` components.
 `hnsw_search` must be given the same `--value-type` and `--component-type` used at build time.
 
 | Value type | Component types | Distances | Storage |
@@ -335,9 +339,10 @@ For sparse datasets, `--value-type` selects how the dataset is stored (`--encode
 | `dotpacking8-f16` | `u16` | dotproduct | DotPacking8, `f16` values |
 | `dotpacking8-scalar4bit` | `u16` | dotproduct | DotPacking8, 4-bit per-component codes |
 
-Every value type except `f32` and `f16` builds the graph on the `f32` dataset and then
-re-encodes the dataset. The blocked layouts need AVX2/F16C/FMA (build with
-`RUSTFLAGS="-C target-cpu=native"`) and are not compiled on other architectures. Indexes built
+`blocked-sparse` builds the graph on the `f16` dataset; every other value type except `f32` and
+`f16` builds it on the `f32` dataset. Both then re-encode the dataset. The blocked layouts have
+AVX2/F16C/FMA kernels on x86_64 (build with `RUSTFLAGS="-C target-cpu=native"`) and NEON kernels
+on aarch64. Indexes built
 with the removed `dotvbyte` encoder cannot be loaded and must be rebuilt.
 
 ## Validation Rules

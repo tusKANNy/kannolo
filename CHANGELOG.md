@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.15.0
+
+The blocked sparse encoder (vectorium 0.11.1, `f16` values) becomes the default for sparse data
+under dot product. It is usually faster than plain `f16`, and at worst a few percent slower.
+
+### Breaking changes
+
+- **Defaults change.**
+
+  | Where | Before | Now |
+  |---|---|---|
+  | `hnsw_build` / `hnsw_search`, sparse | `--value-type f32` | `--value-type blocked-sparse` |
+  | `hnsw_rerank_{build,search}_sparse --first-stage-value-type` | `f16` | `blocked-sparse` |
+  | Python `SparseRerankHNSW(first_stage_value_type=...)` | `"f16"` | `"blocked-sparse"` |
+  | Rust `SparseRerankConfig::l1_pruned` | `SparseFirstStage::F16` | `SparseFirstStage::Blocked` |
+  | Python `SparsePlainHNSW` | plain `f16`, `metric` argument | blocked sparse, dot product only (`metric` removed) |
+
+  The blocked encoder supports only dot product and `u16` components: sparse Euclidean distance or
+  `u32` components in the binaries need an explicit `--value-type` (e.g. `f16`).
+- **Index files do not carry their value type.** Two-stage indexes built with the old default load
+  only if `f16` is passed explicitly. Python `SparsePlainHNSW` dot-product indexes saved by 0.14
+  do not load and must be rebuilt.
+
+### New
+
+- **Blocked two-stage index.** `SparseFirstStage::Blocked` (`blocked-sparse` in the binaries and
+  Python) stores both stages blocked. The graph is built over the `f16` first stage and both
+  datasets are then re-encoded, so the graph is the one an `f16` build gives and every score is the
+  same `f16` product. It supports the standard and permuted graph layouts.
+- **Blocked single-stage graphs are built over `f16`.** `hnsw_build --value-type blocked-sparse`
+  (and Python `SparsePlainHNSW`) build the graph on the `f16` collection, then re-encode it; 0.14
+  built it on `f32`.
+- **Python sparse searches sort each query by component.** The blocked kernel walks a short query
+  (fewer than 33 non-zeros) in component order; numpy queries need not be sorted.
+
 ## 0.14.0
 
 kANNolo moves to vectorium 0.11.1. That release removes DotVByte and adds the

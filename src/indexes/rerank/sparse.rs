@@ -5,13 +5,14 @@
 //!
 //! - `prune_percentage < 100` L1-prunes the first stage to the components carrying the top
 //!   `prune_percentage`% of each vector's L1 mass (`vectorium::l1_prune_split`).
-//! - `first_stage` stores the first stage as `f16` or fixed-point `u8`. The rerank stage is
-//!   always `f16`.
+//! - `first_stage` stores the first stage as blocked sparse (the usual choice), `f16` or
+//!   fixed-point `u8`. The rerank stage holds `f16` values; with a blocked first stage it is
+//!   stored blocked too, so a short query is scored without densifying it in either stage.
 //! - `residual_rerank` stores only the pruned-away components in the rerank stage and scores a
-//!   candidate as first-stage plus rerank score. With an `f16` first stage this is the exact
-//!   score at `f16` precision, `<q, x> = <q, x_pruned> + <q, x_residual>`, and each non-zero of the collection is
-//!   stored once. Without it the rerank stage holds the full vectors and its score replaces the
-//!   first-stage one.
+//!   candidate as first-stage plus rerank score. With an `f16` or blocked first stage this is the
+//!   exact score at `f16` precision, `<q, x> = <q, x_pruned> + <q, x_residual>`, and each
+//!   non-zero of the collection is stored once. Without it the rerank stage holds the full vectors
+//!   and its score replaces the first-stage one.
 //!
 //! Only dot product is supported.
 
@@ -26,9 +27,10 @@ use crate::rerank_index::RerankIndex;
 use vectorium::distances::DotProduct;
 use vectorium::vector::SparseVectorView;
 use vectorium::{
-    Dataset, DatasetGrowable, FixedU8Q, Float, FromF32, Index, IndexSerializer, IndexStats,
-    PlainSparseDataset, PlainSparseDatasetGrowable, PlainSparseQuantizer, ScalarSparseDataset,
-    ScalarSparseDatasetGrowable, ScalarSparseQuantizer, SpaceUsage, ValueType, l1_prune_split,
+    BlockedSparseDataset, Dataset, DatasetGrowable, FixedU8Q, Float, FromF32, Index,
+    IndexSerializer, IndexStats, PlainSparseDataset, PlainSparseDatasetGrowable,
+    PlainSparseQuantizer, ScalarSparseDataset, ScalarSparseDatasetGrowable, ScalarSparseQuantizer,
+    SpaceUsage, ValueType, l1_prune_split,
 };
 
 use super::dense::load_err;
@@ -38,9 +40,13 @@ use vectorium::dataset::ScoredVector;
 /// The rerank dataset, always `f16`.
 type RerankData = PlainSparseDataset<u16, f16, DotProduct>;
 
-/// The two first-stage representations.
+/// The first-stage representations.
 type FirstStageF16 = PlainSparseDataset<u16, f16, DotProduct>;
 type FirstStageU8 = ScalarSparseDataset<u16, f32, FixedU8Q, DotProduct>;
+/// Blocked sparse: the `f16` values and `u16` components of [`FirstStageF16`] packed into
+/// 64-byte blocks; used for both stages.
+type FirstStageBlocked = BlockedSparseDataset;
+type RerankBlocked = BlockedSparseDataset;
 
 enum Inner {
     F16(RerankIndex<HNSW<FirstStageF16, Graph>, RerankData>),
@@ -51,13 +57,21 @@ enum Inner {
     FixedU8StreamVByte(
         RerankIndex<HNSW<FirstStageU8, GenericGraph<StreamVByteNeighbors>>, RerankData>,
     ),
+    Blocked(RerankIndex<HNSW<FirstStageBlocked, Graph>, RerankBlocked>),
 }
+
+const BLOCKED_COMPRESSED: &str = "a blocked first stage supports the standard and permuted graph \
+     layouts; use an f16 or fixed u8 first stage for the compressed layout";
 
 /// The value type the first stage stores.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SparseFirstStage {
     F16,
     FixedU8,
+    /// Blocked sparse for both stages. The graph is built over the `f16` first stage and the
+    /// two datasets are then re-encoded, so it is the graph of an `F16` build with the same
+    /// parameters, and scores are the same `f16` products.
+    Blocked,
 }
 
 /// Build options for [`SparseRerankIndex::build`].
@@ -76,14 +90,14 @@ pub struct SparseRerankConfig {
 }
 
 impl SparseRerankConfig {
-    /// An `f16` first stage L1-pruned at `prune_percentage`, with residual reranking, `m = 32`,
+    /// A blocked first stage L1-pruned at `prune_percentage`, with residual reranking, `m = 32`,
     /// `ef_construction = 200`, standard graph.
     pub fn l1_pruned(prune_percentage: f32) -> Self {
         Self {
             m: 32,
             ef_construction: 200,
             graph: GraphLayout::Standard,
-            first_stage: SparseFirstStage::F16,
+            first_stage: SparseFirstStage::Blocked,
             prune_percentage,
             residual_rerank: true,
         }
@@ -102,13 +116,19 @@ impl SparseRerankConfig {
                      residual is empty",
                 );
             }
-            if self.first_stage == SparseFirstStage::F16 {
+            if matches!(
+                self.first_stage,
+                SparseFirstStage::F16 | SparseFirstStage::Blocked
+            ) {
                 return invalid(
-                    "with no pruning and an f16 first stage the rerank stage would be an \
-                     identical copy; prune the first stage, quantize it to fixed u8, or use a \
+                    "with no pruning and an f16 or blocked first stage the rerank stage would be \
+                     an identical copy; prune the first stage, quantize it to fixed u8, or use a \
                      single-stage HNSW index",
                 );
             }
+        }
+        if self.first_stage == SparseFirstStage::Blocked && self.graph == GraphLayout::Compressed {
+            return invalid(BLOCKED_COMPRESSED);
         }
         check_graph_layout(self.graph, self.m)
     }
@@ -175,6 +195,7 @@ macro_rules! with_index {
             Inner::F16StreamVByte($index) => $body,
             Inner::FixedU8($index) => $body,
             Inner::FixedU8StreamVByte($index) => $body,
+            Inner::Blocked($index) => $body,
         }
     };
 }
@@ -216,6 +237,18 @@ impl SparseRerankIndex {
                 let plain: HNSW<_, Graph> = HNSW::build_index(dataset, &build_cfg);
                 assemble!(plain, rerank, cfg.graph, FixedU8, FixedU8StreamVByte)
             }
+            SparseFirstStage::Blocked => {
+                let dataset: FirstStageF16 = convert_sparse::<f16>(&first_stage);
+                drop(first_stage);
+                let plain: HNSW<_, Graph> = HNSW::build_index(dataset, &build_cfg);
+                let plain = match cfg.graph {
+                    GraphLayout::Permuted => plain.permute_and_encode::<PlainNeighbors>(),
+                    _ => plain, // Compressed is rejected by `validate`
+                };
+                let blocked: HNSW<FirstStageBlocked, Graph> = plain.convert_dataset_into(());
+                let rerank: RerankBlocked = rerank.into();
+                Inner::Blocked(RerankIndex::new(blocked, rerank))
+            }
         };
         Ok(Self {
             inner,
@@ -245,6 +278,12 @@ impl SparseRerankIndex {
             }
             (SparseFirstStage::FixedU8, GraphLayout::Compressed) => {
                 Inner::FixedU8StreamVByte(RerankIndex::load_index(path).map_err(load_err)?)
+            }
+            (SparseFirstStage::Blocked, GraphLayout::Standard | GraphLayout::Permuted) => {
+                Inner::Blocked(RerankIndex::load_index(path).map_err(load_err)?)
+            }
+            (SparseFirstStage::Blocked, GraphLayout::Compressed) => {
+                return invalid(BLOCKED_COMPRESSED);
             }
         };
         Ok(Self {

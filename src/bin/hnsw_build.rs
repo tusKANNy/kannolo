@@ -191,8 +191,12 @@ struct Args {
     /// Value type for stored values. Dense plain: f32, f16. Sparse: f32, f16, fixedu8, fixedu16,
     /// scalaru8, scalaru16, blocked-sparse[-scalaru8|-scalaru16], dotpacking8-{fixedu8, scalaru8,
     /// scalaru16, f16, scalar4bit}. Ignored for pq and rabitq (they determine their own values).
+    /// Default: blocked-sparse for sparse data, f32 for dense data.
     #[clap(long = "value-type", value_enum)]
-    #[arg(default_value_t = ValueTypeArg::F32)]
+    value_type_arg: Option<ValueTypeArg>,
+
+    /// `--value-type`, or its default; set in `main`.
+    #[clap(skip)]
     value_type: ValueTypeArg,
 
     /// Component type for sparse datasets (`u16` or `u32`).
@@ -352,8 +356,15 @@ fn choose_pq_subspaces(dim: usize, requested: usize) -> usize {
 
 fn main() {
     reject_removed_names();
-    let args: Args = Args::parse();
+    let mut args: Args = Args::parse();
     let distance = parse_metric(&args.distance);
+    args.value_type = args
+        .value_type_arg
+        .clone()
+        .unwrap_or(match args.dataset_type {
+            DatasetType::Sparse => ValueTypeArg::BlockedSparse,
+            DatasetType::Dense => ValueTypeArg::F32,
+        });
 
     // Cross-validation of encoder / dataset-type / value-type combinations
     match (&args.dataset_type, &args.encoder) {
@@ -760,7 +771,7 @@ fn build_sparse(args: &Args, distance: Distance, config: &HNSWBuildConfiguration
             build_sparse_converted::<C, D, ScalarU16SparseDataset<C, D>>(args, config)
         }),
         ValueTypeArg::BlockedSparse => {
-            build_sparse_converted::<u16, DotProduct, BlockedSparseDataset>(args, config)
+            build_sparse_converted_from_f16::<BlockedSparseDataset>(args, config)
         }
         ValueTypeArg::BlockedSparseScalaru8 => {
             build_sparse_converted::<u16, DotProduct, BlockedSparseScalarU8Dataset>(args, config)
@@ -832,6 +843,46 @@ where
             config,
             output_file,
             |i| i,
+        ),
+    }
+}
+
+/// Builds the graph on the `f16` dataset, then re-encodes the dataset into `Dfinal`.
+///
+/// For encoders that store `f16` values (blocked sparse): the graph is the one a plain `f16`
+/// build produces, and every score during construction and search is an `f16` product.
+fn build_sparse_converted_from_f16<Dfinal>(args: &Args, config: &HNSWBuildConfiguration)
+where
+    Dfinal: ConvertFrom<PlainSparseDataset<u16, f16, DotProduct>, Config = ()>
+        + Dataset<Owned = Dfinal>
+        + Sync
+        + SpaceUsage
+        + Serialize,
+{
+    let dataset: PlainSparseDataset<u16, f16, DotProduct> = read_sparse_dataset(args);
+    let output_file = &args.output_file;
+    match args.graph_type {
+        GraphType::Standard => {
+            build_and_save::<_, Dfinal, Graph<PlainNeighbors>>(dataset, config, output_file, |i| {
+                i.convert_dataset_into(())
+            })
+        }
+        GraphType::FixedDegree => {
+            build_and_save::<_, Dfinal, GraphFixedDegree>(dataset, config, output_file, |i| {
+                i.convert_dataset_into(())
+            })
+        }
+        GraphType::Permuted => build_permuted_and_save::<_, Dfinal, PlainNeighbors>(
+            dataset,
+            config,
+            output_file,
+            |i| i.convert_dataset_into(()),
+        ),
+        GraphType::Streamvbyte => build_permuted_and_save::<_, Dfinal, StreamVByteNeighbors>(
+            dataset,
+            config,
+            output_file,
+            |i| i.convert_dataset_into(()),
         ),
     }
 }

@@ -16,7 +16,7 @@ from kannolo import (
     DenseFlatIndex,      # Dense exhaustive (brute-force) search
     
     # Sparse HNSW
-    SparsePlainHNSW,     # Sparse plain HNSW
+    SparsePlainHNSW,     # Sparse HNSW, dot product, blocked sparse encoder (f16 values)
     SparseDotPacking8HNSW,  # Sparse DotPacking8 HNSW (u16 components, fixed-point u8 values)
     SparseFixedU8HNSW,   # Sparse fixed u8-encoded HNSW
     SparseFixedU16HNSW,  # Sparse fixed u16-encoded HNSW
@@ -102,13 +102,16 @@ index = DenseFlatIndex.build_from_array(data.flatten(), dim=768, metric="dotprod
 
 ### Sparse Plain HNSW
 
+Dot product only. The collection is stored with the blocked sparse encoder (`f16` values); the
+graph is built over the plain `f16` collection, which is then re-encoded. There is no `metric`
+argument.
+
 ```python
 # From binary file (seismic format)
 index = SparsePlainHNSW.build_from_file(
     "data.bin",
     m=32,
     ef_construction=200,
-    metric="dotproduct"
 )
 
 # From numpy arrays (components and values)
@@ -121,14 +124,13 @@ index = SparsePlainHNSW.build_from_arrays(
     components, values, offsets,
     m=32,
     ef_construction=200,
-    metric="dotproduct"
 )
 ```
 
 ### Sparse Variants (DotPacking8, FixedU8, FixedU16)
 
 ```python
-# All follow the same interface as SparsePlainHNSW
+# Same interface as SparsePlainHNSW, plus `metric`
 # SparseDotPacking8HNSW replaces SparseDotVByteHNSW (removed with vectorium's DotVByte encoder);
 # it supports only dotproduct and u16 components. Old DotVByte index files must be rebuilt.
 index = SparseDotPacking8HNSW.build_from_file("data.bin", m=32, ef_construction=200)
@@ -218,20 +220,22 @@ candidates. Three build options decide what each stage holds:
 
 - `prune_percentage` (float, in `[0, 100]`, required): the first stage keeps, per vector, the
   components carrying the top `prune_percentage`% of its L1 mass. 100 means no pruning
-- `first_stage_value_type` (str): `"f16"` or `"fixedu8"`. The rerank stage is always `f16`.
-  Default: `"f16"`
+- `first_stage_value_type` (str): `"blocked-sparse"`, `"f16"` or `"fixedu8"`. With
+  `"blocked-sparse"` both stages are stored with the blocked sparse encoder (`f16` values) and the
+  graph is built over the `f16` values; otherwise the rerank stage is `f16`. `graph_type="compressed"`
+  needs `"f16"` or `"fixedu8"`. Default: `"blocked-sparse"`
 - `residual_rerank` (bool): store only the pruned-away components in the rerank stage and score a
   candidate as first-stage plus rerank score. Needs `prune_percentage < 100`. Default: False
 
 | `prune_percentage` | `residual_rerank` | first stage | index |
 |---|---|---|---|
-| < 100 | True | `f16` | L1-pruned first stage, exact rescoring at `f16` precision; each non-zero stored once |
+| < 100 | True | `blocked-sparse` or `f16` | L1-pruned first stage, exact rescoring at `f16` precision; each non-zero stored once |
 | < 100 | False | any | pruned first stage, rescored on the full vectors |
 | < 100 | True | `fixedu8` | pruned and quantized first stage; the summed score is approximate |
 | 100 | False | `fixedu8` | quantized first stage, rescored on the full `f16` vectors |
 
 `prune_percentage=100` is rejected with `residual_rerank=True` (the residual would be empty) and
-with an `f16` first stage (the rerank stage would be an identical copy).
+with a `blocked-sparse` or `f16` first stage (the rerank stage would be an identical copy).
 
 ```python
 from kannolo import SparseRerankHNSW
@@ -295,7 +299,7 @@ index.save("my_index.bin")
 
 # Load (must specify metric for types that support it)
 index = DensePlainHNSW.load("my_index.bin", metric="dotproduct")
-index = SparsePlainHNSW.load("my_index.bin", metric="dotproduct")
+index = SparsePlainHNSW.load("my_index.bin")
 index = DensePQHNSW.load("my_index.bin", m_pq=32, metric="dotproduct")
 
 # HNSW indexes built with a non-default graph type must be loaded with the same one
@@ -573,7 +577,7 @@ by `save()`: call `build_acorn_gamma` again after `load()`.
 | Dense vectors, high accuracy | `DensePlainHNSW` | Default choice |
 | Dense vectors, memory limited | `DensePQHNSW` | Quantized, faster search |
 | Dense vectors, ground truth/exhaustive search | `DenseFlatIndex` | Exhaustive, exact neighbors |
-| Sparse vectors, standard | `SparsePlainHNSW` | Plain encoding, good recall |
+| Sparse vectors, standard | `SparsePlainHNSW` | Blocked sparse encoding (`f16` values), dot product |
 | Sparse vectors, memory limited | `SparseFixedU8HNSW` or `SparseDotPacking8HNSW` | Compressed |
 | Sparse vectors, ground truth/exhaustive search | `SparseFlatIndex` | Exhaustive, exact |
 | Dense vectors, compressed first stage + rerank | `DenseRerankHNSW` | Compressed HNSW + `f16` or RaBitQ-ext rerank |

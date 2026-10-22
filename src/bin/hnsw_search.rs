@@ -231,8 +231,12 @@ struct Args {
     /// Value type for stored values. Dense plain: f32, f16. Sparse: f32, f16, fixedu8, fixedu16,
     /// scalaru8, scalaru16, blocked-sparse[-scalaru8|-scalaru16], dotpacking8-{fixedu8, scalaru8,
     /// scalaru16, f16, scalar4bit}. Ignored for pq and rabitq. Must match the build.
+    /// Default: blocked-sparse for sparse data, f32 for dense data.
     #[clap(long = "value-type", value_enum)]
-    #[arg(default_value_t = ValueTypeArg::F32)]
+    value_type_arg: Option<ValueTypeArg>,
+
+    /// `--value-type`, or its default; set in `main`.
+    #[clap(skip)]
     value_type: ValueTypeArg,
 
     /// Component type for sparse datasets (`u16` or `u32`).
@@ -298,8 +302,15 @@ struct Args {
 
 fn main() {
     reject_removed_names();
-    let args: Args = Args::parse();
+    let mut args: Args = Args::parse();
     let metric = parse_metric(&args.distance);
+    args.value_type = args
+        .value_type_arg
+        .clone()
+        .unwrap_or(match args.dataset_type {
+            DatasetType::Sparse => ValueTypeArg::BlockedSparse,
+            DatasetType::Dense => ValueTypeArg::F32,
+        });
 
     // Cross-validation of encoder / dataset-type / value-type combinations
     match (&args.dataset_type, &args.encoder) {

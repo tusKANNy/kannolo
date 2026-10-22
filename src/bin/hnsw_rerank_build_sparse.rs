@@ -3,8 +3,10 @@
 //!
 //! - `--prune-percentage < 100` L1-prunes the first stage to the components carrying the top
 //!   `prune_percentage`% of each vector's L1 mass.
-//! - `--first-stage-value-type` stores the first stage as `f16` or `fixedu8`. The rerank stage is
-//!   always `f16`.
+//! - `--first-stage-value-type` stores the first stage as `blocked-sparse` (the default), `f16` or
+//!   `fixedu8`. With `blocked-sparse` both stages are stored blocked and the graph is built over
+//!   the `f16` values; otherwise the rerank stage is `f16`. The `streamvbyte` graph needs `f16` or
+//!   `fixedu8`.
 //! - `--residual-rerank` stores only the pruned-away components in the rerank stage and sums the
 //!   two scores; with an `f16` first stage this is the exact score at `f16` precision. Without it the rerank stage
 //!   holds the full vectors.
@@ -29,6 +31,8 @@ use vectorium::readers::read_seismic_format;
 enum ValueTypeArg {
     F16,
     Fixedu8,
+    #[value(name = "blocked-sparse")]
+    BlockedSparse,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -58,7 +62,7 @@ struct Args {
     #[clap(long, action)]
     residual_rerank: bool,
 
-    #[clap(long, value_enum, default_value_t = ValueTypeArg::F16)]
+    #[clap(long, value_enum, default_value_t = ValueTypeArg::BlockedSparse)]
     first_stage_value_type: ValueTypeArg,
 
     #[clap(long, value_enum, default_value_t = GraphTypeArg::Standard)]
@@ -85,6 +89,7 @@ fn main() {
         first_stage: match args.first_stage_value_type {
             ValueTypeArg::F16 => SparseFirstStage::F16,
             ValueTypeArg::Fixedu8 => SparseFirstStage::FixedU8,
+            ValueTypeArg::BlockedSparse => SparseFirstStage::Blocked,
         },
         prune_percentage: args.prune_percentage,
         residual_rerank: args.residual_rerank,
