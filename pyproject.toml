@@ -32,4 +32,4 @@ dependencies = [
 ]
 
 [tool.maturin]
-features = ["python"]
+features = ["python", "multivec"]

@@ -1,5 +1,10 @@
 ## Replicate Results
 
+> **To reproduce the results of a specific paper, use
+> [papers_reproducibility](https://github.com/tusKANNy/papers_reproducibility).** It pins the
+> library versions and configurations of each paper. The files below follow the current version of
+> kANNolo and can drift from what a paper measured.
+
 We provide a quick way to replicate the results of our paper. 
 
 Use the [`scripts/run_experiments.py`](../scripts/run_experiments.py) script to quickly reproduce a result from the paper. 

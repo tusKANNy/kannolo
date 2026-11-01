@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+The Python wheel is built with the `multivec` feature, so `SparseMultivecRerankIndex` and
+`SparseMultivecTwoLevelsPQRerankIndex` are available from `pip install kannolo`.
+
 ## 0.15.1
 
 Pins the Rust toolchain to `nightly-2026-06-19` (`rustc 1.98.0-nightly (bc2112ed5 2026-06-18)`). No code changes.
