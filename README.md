@@ -4,8 +4,8 @@
 </h1>
 
 <p align="center">
-    <a href="https://rdcu.be/eii62"><img src="https://badgen.net/static/paper/ECIR 2025/yellow" /></a>
-    <a href="https://arxiv.org/abs/2501.06121"><img src="https://badgen.net/static/arXiv/2501.06121/red" /></a>
+    <a href="https://arxiv.org/abs/2611.03927"><img src="https://badgen.net/static/arXiv/2611.03927/red" /></a>
+    <a href="https://arxiv.org/abs/2501.06121"><img src="https://badgen.net/static/paper/ECIR 2025/yellow" /></a>
 </p>
 
 <p align="center">
@@ -47,12 +47,15 @@ pip install kannolo
 - **Easy to use.** Python bindings, a Rust library, command-line tools, documentation, examples and
   notebooks. If something is unclear, open an issue.
 
-<sub>Numbers from our upcoming journal paper on kANNolo and Vectorium (kANNolo 0.15.1, Vectorium 0.11.1), at 90–99% Accuracy@10. See [Reproducing our papers](#reproducing-our-papers).</sub>
+<sub>Numbers from our paper [*Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo*](https://arxiv.org/abs/2611.03927) (kANNolo 0.15.1, Vectorium 0.11.1), at 90–99% Accuracy@10. See [Reproducing our papers](#reproducing-our-papers).</sub>
 
 **When to use something else.** On learned sparse retrieval, [Seismic](https://github.com/TusKANNy/seismic),
 an inverted index also built on Vectorium, is faster than any graph index, ours included. For
 multi-vector data, kANNolo works best as the reranking step of a two-stage pipeline with a
 single-vector first stage. For a dedicated multi-vector engine, see [TACHIOM](https://github.com/TusKANNy/tachiom).
+kANNolo's indexes are in-memory and static, built once over a fixed collection: if you need
+disk-based indexes, or insertions and
+deletions after construction, look elsewhere for now.
 
 ## Quick start (Python)
 
@@ -199,12 +202,28 @@ versions, configurations and instructions that reproduce the results of our pape
 
 ## 📚 Bibliography
 
-Leonardo Delfino, Domenico Erriquez, Silvio Martinico, Franco Maria Nardini, Cosimo Rulli and Rossano Venturini. "*kANNolo: Sweet and Smooth Approximate k-Nearest Neighbors Search*." Proc. ECIR. 2025.
+1. Silvio Martinico, Franco Maria Nardini, Cosimo Rulli and Rossano Venturini. "*Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo*." arXiv:2611.03927. 2026. Submitted to *Information Systems*.
+2. Leonardo Delfino, Domenico Erriquez, Silvio Martinico, Franco Maria Nardini, Cosimo Rulli and Rossano Venturini. "*kANNolo: Sweet and Smooth Approximate k-Nearest Neighbors Search*." Proc. ECIR. 2025.
 
 ### Citation License
-If you use kANNolo for your work (whether be it a research paper, dissertation, article, poster, presentation, or documentation), please cite our paper:
+If you use kANNolo for your work (whether be it a research paper, dissertation, article, poster, presentation, or documentation), please cite our papers:
 
-ECIR 2025
+arXiv 2026 (submitted to *Information Systems*):
+
+```bibtex
+@misc{martinico2026modularefficientapproximatenearest,
+      title={Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo},
+      author={Silvio Martinico and Franco Maria Nardini and Cosimo Rulli and Rossano Venturini},
+      year={2026},
+      eprint={2611.03927},
+      archivePrefix={arXiv},
+      primaryClass={cs.IR},
+      url={https://arxiv.org/abs/2611.03927},
+}
+```
+
+ECIR 2025:
+
 ```bibtex
 @InProceedings{10.1007/978-3-031-88717-8_29,
 author =    "Leonardo Delfino and
