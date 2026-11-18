@@ -20,10 +20,10 @@ use vectorium::encoders::sparse_scalar::ScalarSparseSupportedDistance;
 use vectorium::readers::{read_npy_f32, read_seismic_format};
 use vectorium::vector_encoder::VectorEncoder;
 use vectorium::{
-    Dataset, DenseDataset, FlatIndex, KMeansBuilder, MeanDataset, PlainDenseDataset,
+    Dataset, DenseDataset, EMeansParams, FlatIndex, KMeansBuilder, MeanDataset, PlainDenseDataset,
     PlainDenseDatasetGrowable, PlainSparseDatasetGrowable, PlainSparseQuantizer, RabitqConfig,
     RabitqExtConfig, RabitqExtQuantizer, RabitqQuantizer, RabitqQueryParams, ScalarDenseDataset,
-    ScalarDenseQuantizer, ScalarSparseDataset, SpaceUsage, WithDistance,
+    ScalarDenseQuantizer, ScalarSparseDataset, Solver, SpaceUsage, WithDistance,
 };
 
 /// Dense input, read as f32. k-means on dense data always clusters under squared Euclidean.
@@ -63,6 +63,18 @@ enum EncoderType {
     RabitqExt,
 }
 
+/// Lloyd's epoch budget when `--kmeans-epochs` is not given (ivf_build's historical default).
+const LLOYD_DEFAULT_EPOCHS: f64 = 25.0;
+/// E-means matches Lloyd at about a fifth of its epochs: `--kmeans-solver emeans` without
+/// `--kmeans-epochs` runs `LLOYD_DEFAULT_EPOCHS / 5` epochs.
+const LLOYD_EPOCHS_PER_EMEANS_EPOCH: f64 = 5.0;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SolverArg {
+    Emeans,
+    Lloyd,
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 enum MetricArg {
     Euclidean,
@@ -87,8 +99,13 @@ struct Args {
     value_type: ValueTypeArg,
     #[clap(long, default_value_t = 1024)]
     n_clusters: usize,
-    #[clap(long, default_value_t = 25)]
-    kmeans_n_iter: usize,
+    /// k-means solver for the coarse centroids. Default: vectorium's default solver.
+    #[clap(long, value_enum)]
+    kmeans_solver: Option<SolverArg>,
+    /// k-means epoch budget (one epoch assigns every training vector once). Default: 25 for
+    /// Lloyd (one iteration per epoch, must be a whole number), 5 for e-means.
+    #[clap(long, alias = "kmeans-n-iter")]
+    kmeans_epochs: Option<f64>,
     #[clap(long, default_value_t = 1)]
     kmeans_n_redo: usize,
     #[clap(long)]
@@ -221,12 +238,23 @@ fn main() {
     }
 
     let kmeans_hnsw = args.kmeans_hnsw || args.n_clusters >= KMEANS_HNSW_THRESHOLD;
+    let solver = match args.kmeans_solver {
+        None => Solver::default(),
+        Some(SolverArg::Lloyd) => Solver::Lloyd,
+        Some(SolverArg::Emeans) => Solver::EMeans(EMeansParams::default()),
+    };
+    let default_epochs = match solver {
+        Solver::Lloyd => LLOYD_DEFAULT_EPOCHS,
+        Solver::EMeans(_) => LLOYD_DEFAULT_EPOCHS / LLOYD_EPOCHS_PER_EMEANS_EPOCH,
+    };
+    let epochs = args.kmeans_epochs.unwrap_or(default_epochs);
     println!(
-        "Running k-means: n_clusters={} n_iter={} n_redo={} hnsw_assignment={}",
-        args.n_clusters, args.kmeans_n_iter, args.kmeans_n_redo, kmeans_hnsw
+        "Running k-means: solver={:?} n_clusters={} epochs={} n_redo={} hnsw_assignment={}",
+        solver, args.n_clusters, epochs, args.kmeans_n_redo, kmeans_hnsw
     );
     let kmeans = KMeansBuilder::new()
-        .n_iter(args.kmeans_n_iter)
+        .solver(solver.clone())
+        .epochs(epochs)
         .n_redo(args.kmeans_n_redo)
         .verbose(true)
         .spherical(args.kmeans_spherical);

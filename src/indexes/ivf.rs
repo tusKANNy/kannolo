@@ -11,7 +11,7 @@ use vectorium::core::vector_encoder::{VectorEncoder, WithDistance};
 use vectorium::distances::DotProduct;
 use vectorium::{
     Dataset, DatasetGrowable, Distance, IndexSerializer, KMeans, KMeansBuilder, MeanDataset,
-    QueryEvaluator, SpaceUsage, SquaredEuclideanDistance, VectorId,
+    QueryEvaluator, Solver, SpaceUsage, SquaredEuclideanDistance, VectorId,
 };
 
 use crate::graph::Graph;
@@ -645,7 +645,10 @@ where
 /// time so `build_index` can take `&self`) plus whether to store residuals.
 pub struct IVFBuildParams {
     pub n_clusters: usize,
-    pub kmeans_n_iter: usize,
+    /// k-means solver for the coarse centroids (`Solver::default()` is vectorium's default).
+    pub kmeans_solver: Solver,
+    /// Epoch budget; `None` uses the solver's default ([`Solver::default_epochs`]).
+    pub kmeans_epochs: Option<f64>,
     pub kmeans_n_redo: usize,
     pub kmeans_seed: Option<u64>,
     pub kmeans_spherical: bool,
@@ -743,8 +746,11 @@ where
         D::Encoder: WithDistance<SquaredEuclideanDistance>,
         for<'a> <D::Encoder as VectorEncoder>::QueryVector<'a>: From<&'a DQ::Vector>,
     {
-        let kmeans = KMeansBuilder::new()
-            .n_iter(p.kmeans_n_iter)
+        let mut kmeans = KMeansBuilder::new().solver(p.kmeans_solver.clone());
+        if let Some(epochs) = p.kmeans_epochs {
+            kmeans = kmeans.epochs(epochs);
+        }
+        let kmeans = kmeans
             .n_redo(p.kmeans_n_redo)
             .seed(p.kmeans_seed)
             .spherical(p.kmeans_spherical);
@@ -860,7 +866,8 @@ mod tests {
         for residual in [false, true] {
             let params = IVFBuildParams {
                 n_clusters: 2,
-                kmeans_n_iter: 10,
+                kmeans_solver: Solver::default(),
+                kmeans_epochs: Some(10.0),
                 kmeans_n_redo: 1,
                 kmeans_seed: Some(42),
                 kmeans_spherical: false,
@@ -920,7 +927,8 @@ mod tests {
 
         let params = IVFBuildParams {
             n_clusters: 2,
-            kmeans_n_iter: 10,
+            kmeans_solver: Solver::default(),
+            kmeans_epochs: Some(10.0),
             kmeans_n_redo: 1,
             kmeans_seed: Some(42),
             kmeans_spherical: false,
@@ -994,7 +1002,8 @@ mod tests {
     fn dense_params(residual: bool) -> IVFBuildParams {
         IVFBuildParams {
             n_clusters: 8,
-            kmeans_n_iter: 10,
+            kmeans_solver: Solver::default(),
+            kmeans_epochs: Some(10.0),
             kmeans_n_redo: 1,
             kmeans_seed: Some(42),
             kmeans_spherical: false,
@@ -1148,7 +1157,8 @@ mod tests {
     fn sparse_params(n_clusters: usize, residual: bool) -> IVFBuildParams {
         IVFBuildParams {
             n_clusters,
-            kmeans_n_iter: 10,
+            kmeans_solver: Solver::default(),
+            kmeans_epochs: Some(10.0),
             kmeans_n_redo: 1,
             kmeans_seed: Some(42),
             kmeans_spherical: false,
@@ -1250,7 +1260,7 @@ mod tests {
         let queries = random_sparse(20, dim, 7);
         let n_clusters = 8;
 
-        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42));
+        let kmeans = KMeansBuilder::new().epochs(5.0).seed(Some(42));
         let a = prepare_ivf::<_, PlainSparseDatasetGrowable<u16, f32, SquaredEuclideanDistance>>(
             &data,
             n_clusters,
@@ -1291,7 +1301,7 @@ mod tests {
         let queries = random_sparse(20, dim, 9);
         let n_clusters = 8;
 
-        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42));
+        let kmeans = KMeansBuilder::new().epochs(5.0).seed(Some(42));
         let a = prepare_ivf::<_, PlainSparseDatasetGrowable<u16, f32, DotProduct>>(
             &data,
             n_clusters,
@@ -1335,7 +1345,7 @@ mod tests {
         let queries = random_sparse(20, dim, 11);
         let n_clusters = 16;
 
-        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42));
+        let kmeans = KMeansBuilder::new().epochs(5.0).seed(Some(42));
         let a = prepare_ivf::<_, PlainSparseDatasetGrowable<u16, f32, DotProduct>>(
             &data,
             n_clusters,

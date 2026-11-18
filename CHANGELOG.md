@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 - unreleased
+
+Moves to vectorium 0.12.0.
+
+- **k-means solver for IVF.** `IVFBuildParams` replaces `kmeans_n_iter` with `kmeans_solver: Solver`
+  (`Solver::default()`, i.e. vectorium's default) and `kmeans_epochs: Option<f64>` (`None` = the
+  solver's default budget). `ivf_build` gains `--kmeans-solver lloyd|emeans` (default: vectorium's
+  default solver) and `--kmeans-epochs` (default 25 for Lloyd, 5 for e-means); `--kmeans-n-iter` is
+  kept as an alias of `--kmeans-epochs`.
 
 The Python wheel is built with the `multivec` feature, so `SparseMultivecRerankIndex` and
 `SparseMultivecTwoLevelsPQRerankIndex` are available from `pip install kannolo`.
