@@ -218,7 +218,8 @@ Options:
       --distance <DISTANCE>              [default: euclidean] [possible values: euclidean, dotproduct]
       --value-type <VALUE_TYPE>          [default: f32] [possible values: f32, f16]
       --n-clusters <N_CLUSTERS>          [default: 1024]
-      --kmeans-n-iter <KMEANS_N_ITER>    [default: 25]
+      --kmeans-solver <SOLVER>           [default: vectorium's default] [possible values: emeans, lloyd]
+      --kmeans-epochs <EPOCHS>           [default: 25 for lloyd, 5 for emeans]
       --kmeans-n-redo <KMEANS_N_REDO>    [default: 1]
       --kmeans-sample-size <SIZE>        (optional; defaults to the whole dataset)
       --kmeans-hnsw                      Use an HNSW index to speed up k-means assignment

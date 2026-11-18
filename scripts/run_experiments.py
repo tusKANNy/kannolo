@@ -16,7 +16,8 @@ IVFFlat TOML parameters
     ef-construction HNSW efc      (ignored when hnsw = false)
     residuals       true / false
     m-pq            PQ subspaces  (omit for plain f32 clusters)
-    kmeans-n-iter   (optional, default 25)
+    kmeans-solver   (optional, lloyd / emeans; default: vectorium's default)
+    kmeans-epochs   (optional, default 25 for lloyd, 5 for emeans)
     kmeans-n-redo   (optional, default 1)
 
   [querying_parameters]
@@ -192,8 +193,12 @@ def _build_ivf_params(configs, input_file, output_file):
         params.append("--residuals")
     if "m-pq" in ip:
         params.append(f"--m-pq {ip['m-pq']}")
-    if "kmeans-n-iter" in ip:
-        params.append(f"--kmeans-n-iter {ip['kmeans-n-iter']}")
+    if "kmeans-solver" in ip:
+        params.append(f"--kmeans-solver {ip['kmeans-solver']}")
+    if "kmeans-epochs" in ip:
+        params.append(f"--kmeans-epochs {ip['kmeans-epochs']}")
+    elif "kmeans-n-iter" in ip:  # older configs; same value (one Lloyd iteration = one epoch)
+        params.append(f"--kmeans-epochs {ip['kmeans-n-iter']}")
     if "kmeans-n-redo" in ip:
         params.append(f"--kmeans-n-redo {ip['kmeans-n-redo']}")
     if "kmeans-sample-size" in ip:

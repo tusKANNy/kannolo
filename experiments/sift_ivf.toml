@@ -30,7 +30,7 @@ hnsw =          false
 residuals =     true
 metric = "euclidean"
 m-pq =  64
-kmeans-n-iter = 10
+kmeans-epochs = 10
 kmeans-n-redo = 1
 
 # ---- Search parameters ------------------------------------------------------
