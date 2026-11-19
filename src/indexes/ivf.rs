@@ -10,8 +10,10 @@ use vectorium::core::index::Index;
 use vectorium::core::vector_encoder::{VectorEncoder, WithDistance};
 use vectorium::distances::DotProduct;
 use vectorium::{
-    Dataset, DatasetGrowable, Distance, IndexSerializer, KMeans, KMeansBuilder, MeanDataset,
-    QueryEvaluator, Solver, SpaceUsage, SquaredEuclideanDistance, VectorId,
+    CentroidIndexBuilder, Dataset, DatasetGrowable, Distance, FlatIndex, IndexSerializer, KMeans,
+    KMeansBuilder, MeanDataset, QueryEvaluator, ScalarDenseDataset, ScalarDenseDatasetGrowable,
+    ScalarSparseDataset, ScalarSparseDatasetGrowable, Solver, SpaceUsage, SquaredEuclideanDistance,
+    VectorId,
 };
 
 use crate::graph::Graph;
@@ -353,10 +355,42 @@ where
 // Build
 // ---------------------------------------------------------------------------
 
-/// Auto-threshold: use HNSW for centroid assignment when `n_clusters` reaches
-/// this value. Below it a flat exhaustive scan is fast enough; above it
-/// building + searching an HNSW is faster.
-pub const KMEANS_HNSW_THRESHOLD: usize = 32_768;
+/// Number of clusters from which [`AnnAssignment::Auto`] assigns vectors to centroids through an
+/// ANN index over the centroids.
+///
+/// Below it, an exhaustive scan over the centroids is used.
+pub const KMEANS_ANN_THRESHOLD: usize = 4_096;
+
+/// Whether k-means assigns vectors to centroids through an ANN index over the centroids instead
+/// of an exhaustive scan.
+///
+/// The index is chosen by solver: **HNSW for Lloyd**, which refreshes it
+/// once per epoch, so search speed decides; **an IVF over the centroids for e-means**
+/// ([`IvfCentroidIndexBuilder`]), which refreshes it after every
+/// mini-batch, so refresh cost decides and the IVF only re-files the moved centroids. The final
+/// assignment of every vector uses an HNSW for both solvers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+pub enum AnnAssignment {
+    /// On from [`KMEANS_ANN_THRESHOLD`] clusters, off below.
+    #[default]
+    Auto,
+    /// Always use an ANN index.
+    On,
+    /// Always scan every centroid.
+    Off,
+}
+
+impl AnnAssignment {
+    /// Whether to use an ANN index for `n_clusters` clusters.
+    pub fn enabled(self, n_clusters: usize) -> bool {
+        match self {
+            AnnAssignment::Auto => n_clusters >= KMEANS_ANN_THRESHOLD,
+            AnnAssignment::On => true,
+            AnnAssignment::Off => false,
+        }
+    }
+}
 
 /// HNSW parameters used for centroid assignment during k-means.
 /// If you want better quality, increase ef_search and eventually ef_construction.
@@ -429,8 +463,10 @@ impl<C> BuildArtifacts<C> {
 /// A sample of ~256 × n_clusters is typically sufficient for good centroid
 /// quality and reduces training time from O(n · k) to O(s · k) per iteration.
 ///
-/// `kmeans_hnsw`: assign vectors to centroids, during k-means and for the final pass, through an
-/// HNSW over the centroids instead of a flat scan.
+/// `ann_assignment`: assign vectors to centroids through an ANN index over the centroids instead
+/// of a flat scan (resolve it with [`AnnAssignment::enabled`]). During k-means the index is an
+/// HNSW for Lloyd and an IVF over the centroids for e-means ([`IvfCentroidIndexBuilder`]); the
+/// final pass over all vectors always uses an HNSW.
 ///
 /// `refine` runs on every centroid after each k-means update, with the IDs (in `dataset`) of
 /// the vectors assigned to it; see [`vectorium::sparse_centroid_pruning`]. Pass `|_, _| {}`
@@ -441,13 +477,13 @@ pub fn prepare_ivf<D, G>(
     kmeans_builder: KMeansBuilder,
     centroid_encoder: G::Encoder,
     sample_size: Option<usize>,
-    kmeans_hnsw: bool,
+    ann_assignment: bool,
     refine: impl Fn(&[u32], &mut D::Vector) + Sync,
 ) -> BuildArtifacts<G::Owned>
 where
     D: MeanDataset + Sync,
     G: DatasetGrowable + MeanDataset<Vector = D::Vector> + Clone + Sync + Into<G::Owned>,
-    G::Owned: Clone + Sync + SpaceUsage,
+    G::Owned: Clone + Sync + SpaceUsage + IvfCentroids,
     G::Encoder: VectorEncoder<QueryParams = ()> + Clone,
     <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
     for<'a> <G::Encoder as VectorEncoder>::InputVector<'a>: From<&'a D::Vector>,
@@ -474,7 +510,7 @@ where
                 &sample,
                 n_clusters,
                 centroid_encoder,
-                kmeans_hnsw,
+                ann_assignment,
                 |members: &[u32], centroid: &mut D::Vector| {
                     let members: Vec<u32> = members.iter().map(|&m| ids[m as usize]).collect();
                     refine(&members, centroid)
@@ -486,12 +522,12 @@ where
             dataset,
             n_clusters,
             centroid_encoder,
-            kmeans_hnsw,
+            ann_assignment,
             &refine,
         ),
     };
 
-    let assignments = if kmeans_hnsw {
+    let assignments = if ann_assignment {
         let centroid_index =
             HNSW::<G::Owned, Graph>::build_index(centroids.clone(), &kmeans_hnsw_build_config());
         KMeans::assign_with_index(dataset, &centroid_index, &kmeans_hnsw_search_config())
@@ -499,21 +535,26 @@ where
         KMeans::compute_assignments(dataset, &centroids)
     };
 
-    // CSR offsets from per-cluster counts.
-    let mut cluster_sizes = vec![0u32; n_clusters];
-    for &(_, c) in &assignments {
-        cluster_sizes[c] += 1;
-    }
+    group_by_centroid(centroids, n_clusters, &assignments)
+}
+
+/// Groups vectors by their assigned centroid: CSR offsets plus the order that makes each
+/// cluster contiguous.
+fn group_by_centroid<C>(
+    centroids: C,
+    n_clusters: usize,
+    assignments: &[(f32, usize)],
+) -> BuildArtifacts<C> {
     let mut cluster_offsets = vec![0u32; n_clusters + 1];
-    for c in 0..n_clusters {
-        cluster_offsets[c + 1] = cluster_offsets[c] + cluster_sizes[c];
+    for &(_, c) in assignments {
+        cluster_offsets[c + 1] += 1;
     }
-
-    // Order grouping vectors by cluster. Unstable sort: order within a
-    // cluster is arbitrary and irrelevant for correctness.
-    let mut order: Vec<u32> = (0..n as u32).collect();
+    for c in 0..n_clusters {
+        cluster_offsets[c + 1] += cluster_offsets[c];
+    }
+    // Unstable sort: order within a cluster is arbitrary and irrelevant for correctness.
+    let mut order: Vec<u32> = (0..assignments.len() as u32).collect();
     order.sort_unstable_by_key(|&i| assignments[i as usize].1);
-
     BuildArtifacts {
         centroids,
         cluster_offsets: cluster_offsets.into_boxed_slice(),
@@ -521,25 +562,52 @@ where
     }
 }
 
-/// k-means on `training`, with flat or HNSW centroid assignment.
+/// Assigns every vector of `dataset` to its nearest vector of `centroids` (exhaustive scan,
+/// under `centroids`' metric) and groups the vectors by centroid: the clustering of
+/// [`prepare_ivf`] for centroids that are already known.
+pub fn assign_to_centroids<D, C>(dataset: &D, centroids: C) -> BuildArtifacts<C>
+where
+    D: MeanDataset + Sync,
+    C: Dataset + Sync,
+    C::Encoder: VectorEncoder<QueryParams = ()>,
+    <C::Encoder as VectorEncoder>::Distance: Distance,
+    for<'a> &'a D::Vector: Into<<C::Encoder as VectorEncoder>::QueryVector<'a>>,
+{
+    let assignments = KMeans::compute_assignments(dataset, &centroids);
+    let n_clusters = centroids.len();
+    group_by_centroid(centroids, n_clusters, &assignments)
+}
+
+/// k-means on `training`, with flat or ANN centroid assignment (see [`AnnAssignment`] for which
+/// index each solver uses).
 fn train_centroids<T, G>(
     kmeans: &KMeans,
     training: &T,
     n_clusters: usize,
     centroid_encoder: G::Encoder,
-    kmeans_hnsw: bool,
+    ann_assignment: bool,
     refine: impl Fn(&[u32], &mut T::Vector) + Sync,
 ) -> G::Owned
 where
     T: MeanDataset + Sync,
-    G: DatasetGrowable + Clone + Sync + Into<G::Owned>,
-    G::Owned: Sync + SpaceUsage,
-    G::Encoder: VectorEncoder<QueryParams = ()>,
+    G: DatasetGrowable + MeanDataset<Vector = T::Vector> + Clone + Sync + Into<G::Owned>,
+    G::Owned: Sync + SpaceUsage + IvfCentroids,
+    G::Encoder: VectorEncoder<QueryParams = ()> + Clone,
     <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
     for<'a> <G::Encoder as VectorEncoder>::InputVector<'a>: From<&'a T::Vector>,
     for<'a> <G::Encoder as VectorEncoder>::QueryVector<'a>: From<&'a T::Vector>,
 {
-    let centroids: G = if kmeans_hnsw {
+    let centroids: G = if ann_assignment && !matches!(kmeans.solver(), Solver::Lloyd) {
+        kmeans.train_with_index_refined(
+            training,
+            n_clusters,
+            None,
+            centroid_encoder,
+            IvfCentroidIndexBuilder::default(),
+            &<G::Owned as IvfCentroids>::ivf_search_params(CENTROID_IVF_N_PROBE),
+            refine,
+        )
+    } else if ann_assignment {
         let build_cfg = kmeans_hnsw_build_config();
         kmeans.train_with_index_refined(
             training,
@@ -652,6 +720,8 @@ pub struct IVFBuildParams {
     pub kmeans_n_redo: usize,
     pub kmeans_seed: Option<u64>,
     pub kmeans_spherical: bool,
+    /// ANN-accelerated centroid assignment during k-means (default: [`AnnAssignment::Auto`]).
+    pub ann_assignment: AnnAssignment,
     /// Store residuals `r = v − c` (`true`) or original vectors (`false`).
     pub residual: bool,
 }
@@ -735,7 +805,13 @@ where
     ) -> Self
     where
         G: DatasetGrowable + MeanDataset<Vector = DQ::Vector> + Clone + Sync + Into<G::Owned>,
-        G::Owned: MeanDataset<Vector = DQ::Vector> + Clone + Sync + SpaceUsage + Into<DQ> + Into<S>,
+        G::Owned: MeanDataset<Vector = DQ::Vector>
+            + Clone
+            + Sync
+            + SpaceUsage
+            + IvfCentroids
+            + Into<DQ>
+            + Into<S>,
         G::Encoder: VectorEncoder<QueryParams = ()> + Clone,
         <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
         for<'a> <G::Encoder as VectorEncoder>::InputVector<'a>: From<&'a DQ::Vector>,
@@ -760,7 +836,7 @@ where
             kmeans,
             centroid_encoder.clone(),
             None,
-            p.n_clusters >= KMEANS_HNSW_THRESHOLD,
+            p.ann_assignment.enabled(p.n_clusters),
             |_, _| {},
         );
         let stored: S = if p.residual {
@@ -785,6 +861,227 @@ where
             correction,
             p.residual,
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IVF over a fixed coarse quantizer, and as the centroid index of e-means
+// ---------------------------------------------------------------------------
+
+impl<DQ, D> IVF<DQ, D, FlatIndex<DQ>>
+where
+    DQ: MeanDataset<Owned = DQ> + Sync,
+    DQ::Encoder: VectorEncoder<QueryParams = ()>,
+    <DQ::Encoder as VectorEncoder>::Distance: ReportedMetric,
+    for<'a> &'a DQ::Vector: Into<<DQ::Encoder as VectorEncoder>::QueryVector<'a>>,
+    D: Dataset,
+    D::Encoder: VectorEncoder<QueryParams = ()> + WithDistance<SquaredEuclideanDistance>,
+    for<'a> <D::Encoder as VectorEncoder>::QueryVector<'a>: From<&'a DQ::Vector>,
+{
+    /// Builds a plain (non-residual) IVF that files `vectors` under the given coarse
+    /// quantizer `coarse` (searched exhaustively): each vector goes to its nearest coarse
+    /// centroid, and the lists are stored as `D` via the dot-product relabelling `S`.
+    pub fn over_centroids<S>(coarse: DQ, vectors: &DQ) -> Self
+    where
+        S: Dataset + From<DQ>,
+        D: for<'a> ConvertFrom<&'a S, Config = ()>,
+    {
+        let a = assign_to_centroids(vectors, coarse);
+        let stored: S = a.reorder(vectors).into();
+        let (cluster, correction) = encode_clusters::<Reported<DQ>, S, D, (), DQ>(
+            &stored,
+            (),
+            &(),
+            &a.centroids,
+            &a.cluster_offsets,
+            false,
+        );
+        IVF::from_parts(
+            FlatIndex::from(a.centroids),
+            cluster,
+            a.cluster_offsets,
+            a.external_ids,
+            correction,
+            false,
+        )
+    }
+
+    /// Re-files `vectors` (for instance, centroids that moved) under this IVF's coarse
+    /// quantizer, which is kept as is. Costs one exhaustive assignment against the coarse
+    /// quantizer plus one encoding pass over `vectors`.
+    pub fn refile<S>(self, vectors: &DQ) -> Self
+    where
+        S: Dataset + From<DQ>,
+        D: for<'a> ConvertFrom<&'a S, Config = ()>,
+    {
+        Self::over_centroids::<S>(self.centroid_index.into_dataset(), vectors)
+    }
+}
+
+/// Lists probed per query when an IVF serves as the centroid index of e-means.
+pub const CENTROID_IVF_N_PROBE: usize = 16;
+
+/// Lists of an IVF over `k` centroids: `4·sqrt(k)` rounded up to a power of two, capped at `k`.
+pub fn centroid_ivf_n_lists(k: usize) -> usize {
+    ((4.0 * (k as f64).sqrt()).ceil() as usize)
+        .next_power_of_two()
+        .clamp(1, k.max(1))
+}
+
+/// Centroid datasets that an [`IVF`] can index, so that e-means can assign vectors through it.
+///
+/// Names the IVF type (dot-product cluster storage `D`, exhaustive coarse search) for each
+/// centroid representation, and builds and refreshes it. Implemented for the dense and sparse
+/// scalar datasets kANNolo and TACHIOM cluster with.
+pub trait IvfCentroids: MeanDataset + Sized {
+    /// The IVF over these centroids.
+    type Ivf: for<'q> Index<
+            Query<'q> = <<Self as Dataset>::Encoder as VectorEncoder>::QueryVector<'q>,
+            SearchParams: Sync,
+        > + Sync;
+
+    /// Trains a coarse quantizer of `n_lists` lists on `vectors` and files them into it.
+    fn build_ivf(vectors: Self, n_lists: usize, seed: u64) -> Self::Ivf;
+
+    /// Re-files moved `vectors`, keeping the coarse quantizer.
+    fn refile_ivf(ivf: Self::Ivf, vectors: Self) -> Self::Ivf;
+
+    /// Search parameters probing `n_probe` lists.
+    fn ivf_search_params(n_probe: usize) -> <Self::Ivf as Index>::SearchParams;
+}
+
+/// Coarse quantizer of an IVF over `vectors`: Lloyd, 10 epochs, on 20 vectors sampled per list.
+fn train_coarse<G>(vectors: &G::Owned, encoder: G::Encoder, n_lists: usize, seed: u64) -> G::Owned
+where
+    G: DatasetGrowable + MeanDataset + Clone + Sync + Into<G::Owned>,
+    G::Owned: MeanDataset<Vector = G::Vector>,
+    G::Encoder: VectorEncoder<QueryParams = ()> + Clone,
+    <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
+    for<'a> &'a G::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>
+        + Into<<G::Encoder as VectorEncoder>::QueryVector<'a>>,
+{
+    let k = vectors.len();
+    let n_sample = (20 * n_lists).clamp(n_lists, k);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut ids = rand_index::sample(&mut rng, k, n_sample).into_vec();
+    ids.sort_unstable();
+    let mut sample = G::with_capacity(encoder.clone(), n_sample);
+    for &i in &ids {
+        sample.push((&vectors.vector(i as u32)).into());
+    }
+    KMeansBuilder::new()
+        .solver(Solver::Lloyd)
+        .epochs(10.0)
+        .seed(Some(seed))
+        .build()
+        .train::<G, G>(&sample, n_lists, None, encoder)
+        .into()
+}
+
+macro_rules! impl_ivf_centroids {
+    ($owned:ty, $growable:ty, $stored:ty, $cluster:ty) => {
+        impl IvfCentroids for $owned {
+            type Ivf = IVF<$owned, $cluster, FlatIndex<$owned>>;
+
+            fn build_ivf(vectors: Self, n_lists: usize, seed: u64) -> Self::Ivf {
+                let n_lists = n_lists.clamp(1, vectors.len().max(1));
+                let coarse =
+                    train_coarse::<$growable>(&vectors, vectors.encoder().clone(), n_lists, seed);
+                IVF::over_centroids::<$stored>(coarse, &vectors)
+            }
+
+            fn refile_ivf(ivf: Self::Ivf, vectors: Self) -> Self::Ivf {
+                ivf.refile::<$stored>(&vectors)
+            }
+
+            fn ivf_search_params(n_probe: usize) -> <Self::Ivf as Index>::SearchParams {
+                IVFSearchParams {
+                    nprobe: n_probe,
+                    centroid_search_params: (),
+                    cluster_query_params: (),
+                }
+            }
+        }
+    };
+}
+
+macro_rules! impl_ivf_centroids_dense {
+    ($vout:ty) => {
+        impl_ivf_centroids!(
+            ScalarDenseDataset<f32, $vout, SquaredEuclideanDistance>,
+            ScalarDenseDatasetGrowable<f32, $vout, SquaredEuclideanDistance>,
+            ScalarDenseDataset<f32, $vout, DotProduct>,
+            ScalarDenseDataset<$vout, $vout, DotProduct>
+        );
+        impl_ivf_centroids!(
+            ScalarDenseDataset<f32, $vout, DotProduct>,
+            ScalarDenseDatasetGrowable<f32, $vout, DotProduct>,
+            ScalarDenseDataset<f32, $vout, DotProduct>,
+            ScalarDenseDataset<$vout, $vout, DotProduct>
+        );
+    };
+}
+impl_ivf_centroids_dense!(f32);
+impl_ivf_centroids_dense!(half::f16);
+
+macro_rules! impl_ivf_centroids_sparse {
+    ($c:ty) => {
+        impl_ivf_centroids!(
+            ScalarSparseDataset<$c, f32, f32, SquaredEuclideanDistance>,
+            ScalarSparseDatasetGrowable<$c, f32, f32, SquaredEuclideanDistance>,
+            ScalarSparseDataset<$c, f32, f32, DotProduct>,
+            ScalarSparseDataset<$c, f32, f32, DotProduct>
+        );
+        impl_ivf_centroids!(
+            ScalarSparseDataset<$c, f32, f32, DotProduct>,
+            ScalarSparseDatasetGrowable<$c, f32, f32, DotProduct>,
+            ScalarSparseDataset<$c, f32, f32, DotProduct>,
+            ScalarSparseDataset<$c, f32, f32, DotProduct>
+        );
+    };
+}
+impl_ivf_centroids_sparse!(u16);
+impl_ivf_centroids_sparse!(u32);
+
+/// [`CentroidIndexBuilder`] that assigns k-means training vectors through an [`IVF`] over the
+/// centroids, for e-means: the coarse quantizer is trained on the first build, and every refresh
+/// only re-files the moved centroids ([`IVF::refile`]).
+///
+/// E-means refreshes the centroid index after every mini-batch, tens of times per epoch, so the
+/// refresh cost decides: rebuilding an HNSW each time would be expensive. Lloyd refreshes once
+/// per epoch and uses an HNSW.
+#[derive(Clone, Debug)]
+pub struct IvfCentroidIndexBuilder {
+    /// Number of lists; `None` uses [`centroid_ivf_n_lists`].
+    pub n_lists: Option<usize>,
+    /// Seed of the coarse quantizer's sample and k-means.
+    pub seed: u64,
+}
+
+impl Default for IvfCentroidIndexBuilder {
+    fn default() -> Self {
+        Self {
+            n_lists: None,
+            seed: 42,
+        }
+    }
+}
+
+impl<G> CentroidIndexBuilder<G> for IvfCentroidIndexBuilder
+where
+    G: Dataset + Into<G::Owned>,
+    G::Owned: IvfCentroids,
+{
+    type Index = <G::Owned as IvfCentroids>::Ivf;
+
+    fn build(&mut self, centroids: G) -> Self::Index {
+        let k = centroids.len();
+        let n_lists = self.n_lists.unwrap_or_else(|| centroid_ivf_n_lists(k));
+        <G::Owned as IvfCentroids>::build_ivf(centroids.into(), n_lists, self.seed)
+    }
+
+    fn refresh(&mut self, index: Self::Index, centroids: G) -> Self::Index {
+        <G::Owned as IvfCentroids>::refile_ivf(index, centroids.into())
     }
 }
 
@@ -871,6 +1168,7 @@ mod tests {
                 kmeans_n_redo: 1,
                 kmeans_seed: Some(42),
                 kmeans_spherical: false,
+                ann_assignment: AnnAssignment::Auto,
                 residual,
             };
             let index = Ivf::build_index::<DenseCentroids, DensePlainDP, _>(
@@ -932,6 +1230,7 @@ mod tests {
             kmeans_n_redo: 1,
             kmeans_seed: Some(42),
             kmeans_spherical: false,
+            ann_assignment: AnnAssignment::Auto,
             residual: false,
         };
 
@@ -1007,6 +1306,7 @@ mod tests {
             kmeans_n_redo: 1,
             kmeans_seed: Some(42),
             kmeans_spherical: false,
+            ann_assignment: AnnAssignment::Auto,
             residual,
         }
     }
@@ -1162,6 +1462,7 @@ mod tests {
             kmeans_n_redo: 1,
             kmeans_seed: Some(42),
             kmeans_spherical: false,
+            ann_assignment: AnnAssignment::Auto,
             residual,
         }
     }
@@ -1412,6 +1713,63 @@ mod tests {
                 let (g, w) = (g.distance.distance(), w.distance.distance());
                 assert!((g - w).abs() <= 1e-4 * w.abs(), "{g} vs {w}");
             }
+        }
+    }
+
+    // ---- IVF over centroids (e-means centroid index) ----------------------------------
+
+    #[test]
+    fn centroid_ivf_lists_scale_with_sqrt_k() {
+        assert_eq!(centroid_ivf_n_lists(32768), 1024);
+        assert_eq!(centroid_ivf_n_lists(65536), 1024);
+        assert_eq!(centroid_ivf_n_lists(4096), 256);
+        assert_eq!(centroid_ivf_n_lists(1), 1);
+    }
+
+    #[test]
+    fn ivf_over_centroids_files_each_once_and_full_probe_is_exact() {
+        let (k, d) = (2000, 16);
+        let vectors = random_dense(k, d, 1);
+        let ivf = DensePlain::build_ivf(vectors.clone(), 64, 42);
+        assert_eq!(ivf.n_elements(), k);
+        let mut ids = ivf.external_ids.to_vec();
+        ids.sort_unstable();
+        assert!(ids.iter().enumerate().all(|(i, &c)| i as u32 == c));
+
+        let flat = FlatIndex::from(vectors);
+        let all = DensePlain::ivf_search_params(ivf.n_clusters());
+        let queries = random_dense(50, d, 2);
+        for q in 0..50 {
+            let v = queries.vector(q);
+            let view = vectorium::core::vector::DenseVectorView::new(v.values());
+            let a = Index::search(&ivf, view, 1, &all)[0];
+            let b = flat.search(view, 1, &())[0];
+            assert_eq!(a.vector, b.vector);
+            // The IVF reports ‖q − v‖² without the per-query constant ‖q‖² (rank-equivalent;
+            // k-means recomputes the distance exactly anyway).
+            let q2: f32 = v.values().iter().map(|x| x * x).sum();
+            assert!((a.distance.distance() + q2 - b.distance.distance()).abs() < 1e-2);
+        }
+    }
+
+    #[test]
+    fn refile_keeps_the_coarse_quantizer_and_finds_moved_centroids() {
+        let (k, d) = (1000, 8);
+        let ivf = DensePlain::build_ivf(random_dense(k, d, 3), 32, 42);
+        let coarse_before = ivf.centroid_index.dataset().values().to_vec();
+        let moved = random_dense(k, d, 4);
+        let ivf = DensePlain::refile_ivf(ivf, moved.clone());
+        assert_eq!(ivf.centroid_index.dataset().values(), &coarse_before[..]);
+        let p = DensePlain::ivf_search_params(CENTROID_IVF_N_PROBE);
+        for c in [0u32, 17, 999] {
+            let v = moved.vector(c);
+            let r = Index::search(
+                &ivf,
+                vectorium::core::vector::DenseVectorView::new(v.values()),
+                1,
+                &p,
+            );
+            assert_eq!(r[0].vector, c as VectorId);
         }
     }
 }

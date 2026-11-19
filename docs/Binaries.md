@@ -222,7 +222,8 @@ Options:
       --kmeans-epochs <EPOCHS>           [default: 25 for lloyd, 5 for emeans]
       --kmeans-n-redo <KMEANS_N_REDO>    [default: 1]
       --kmeans-sample-size <SIZE>        (optional; defaults to the whole dataset)
-      --kmeans-hnsw                      Use an HNSW index to speed up k-means assignment
+      --kmeans-ann <auto|on|off>         ANN-accelerated k-means assignment [default: auto, on from 4096 clusters]
+                                         (HNSW for lloyd, IVF over the centroids for emeans)
       --kmeans-spherical                 L2-normalize centroids each iteration
       --residuals                        Encode vectors as residuals from their centroid
       --hnsw                             Index the centroids with HNSW instead of scanning them

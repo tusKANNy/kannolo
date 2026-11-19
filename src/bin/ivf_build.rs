@@ -9,7 +9,7 @@ use serde::Serialize;
 use kannolo::graph::Graph;
 use kannolo::hnsw::{HNSW, HNSWBuildConfiguration};
 use kannolo::ivf::{
-    BuildArtifacts, IVF, KMEANS_HNSW_THRESHOLD, ReportedMetric, encode_clusters, prepare_ivf,
+    AnnAssignment, BuildArtifacts, IVF, IvfCentroids, ReportedMetric, encode_clusters, prepare_ivf,
 };
 use vectorium::core::dataset::ConvertFrom;
 use vectorium::core::index::Index;
@@ -141,9 +141,11 @@ struct Args {
     /// Quantize each RaBitQ-ext vector with an exact per-vector rescale search.
     #[clap(long, default_value_t = false)]
     rabitq_exact_quant: bool,
-    /// Use HNSW for centroid assignment during k-means (default: auto when n_clusters >= 32768).
-    #[clap(long, default_value_t = false)]
-    kmeans_hnsw: bool,
+    /// ANN-accelerated centroid assignment during k-means: `auto` turns it on from 4,096
+    /// clusters. The index is chosen by solver: HNSW for Lloyd, an IVF over the centroids for
+    /// e-means. The final assignment of every vector uses an HNSW.
+    #[clap(long, value_enum, default_value_t = AnnAssignment::Auto)]
+    kmeans_ann: AnnAssignment,
     /// Spherical k-means: L2-normalize centroids after each update. Dense only: on sparse data
     /// the centroids' magnitudes are what dot-product clustering relies on.
     #[clap(long, default_value_t = false)]
@@ -237,7 +239,7 @@ fn main() {
         }
     }
 
-    let kmeans_hnsw = args.kmeans_hnsw || args.n_clusters >= KMEANS_HNSW_THRESHOLD;
+    let ann_assignment = args.kmeans_ann.enabled(args.n_clusters);
     let solver = match args.kmeans_solver {
         None => Solver::default(),
         Some(SolverArg::Lloyd) => Solver::Lloyd,
@@ -249,8 +251,8 @@ fn main() {
     };
     let epochs = args.kmeans_epochs.unwrap_or(default_epochs);
     println!(
-        "Running k-means: solver={:?} n_clusters={} epochs={} n_redo={} hnsw_assignment={}",
-        solver, args.n_clusters, epochs, args.kmeans_n_redo, kmeans_hnsw
+        "Running k-means: solver={:?} n_clusters={} epochs={} n_redo={} ann_assignment={}",
+        solver, args.n_clusters, epochs, args.kmeans_n_redo, ann_assignment
     );
     let kmeans = KMeansBuilder::new()
         .solver(solver.clone())
@@ -273,11 +275,11 @@ fn main() {
                 ));
             }
             match args.distance.as_ref().unwrap_or(&MetricArg::Euclidean) {
-                MetricArg::Euclidean => build_dense(raw, kmeans, kmeans_hnsw, &args),
+                MetricArg::Euclidean => build_dense(raw, kmeans, ann_assignment, &args),
                 MetricArg::Dotproduct => build_dense(
                     PlainDenseDataset::<f32, DotProduct>::from(raw),
                     kmeans,
-                    kmeans_hnsw,
+                    ann_assignment,
                     &args,
                 ),
             }
@@ -297,10 +299,10 @@ fn main() {
                 .unwrap_or(&MetricArg::Dotproduct)
             {
                 MetricArg::Dotproduct => {
-                    build_sparse::<DotProduct>(data, kmeans, kmeans_hnsw, &args)
+                    build_sparse::<DotProduct>(data, kmeans, ann_assignment, &args)
                 }
                 MetricArg::Euclidean => {
-                    build_sparse::<SquaredEuclideanDistance>(data, kmeans, kmeans_hnsw, &args)
+                    build_sparse::<SquaredEuclideanDistance>(data, kmeans, ann_assignment, &args)
                 }
             }
         }
@@ -311,7 +313,7 @@ fn main() {
 fn build_dense<M>(
     data: PlainDenseDataset<f32, M>,
     kmeans: KMeansBuilder,
-    kmeans_hnsw: bool,
+    ann_assignment: bool,
     args: &Args,
 ) where
     M: ScalarDenseSupportedDistance + ReportedMetric,
@@ -326,7 +328,7 @@ fn build_dense<M>(
         kmeans,
         ScalarDenseQuantizer::new(data.input_dim()),
         args.kmeans_sample_size,
-        kmeans_hnsw,
+        ann_assignment,
         |_, _| {},
     );
     println!(
@@ -398,10 +400,10 @@ fn build_dense<M>(
 }
 
 /// Sparse: cluster under `M`, route with f32 centroids under dot product.
-fn build_sparse<M>(data: Sparse, kmeans: KMeansBuilder, kmeans_hnsw: bool, args: &Args)
+fn build_sparse<M>(data: Sparse, kmeans: KMeansBuilder, ann_assignment: bool, args: &Args)
 where
     M: ScalarSparseSupportedDistance + From<f32>,
-    vectorium::PlainSparseDataset<u16, f32, M>: Into<Sparse>,
+    vectorium::PlainSparseDataset<u16, f32, M>: Into<Sparse> + IvfCentroids,
 {
     let build_start = Instant::now();
     let prune = args
@@ -413,7 +415,7 @@ where
         kmeans,
         PlainSparseQuantizer::new(data.input_dim(), data.input_dim()),
         args.kmeans_sample_size,
-        kmeans_hnsw,
+        ann_assignment,
         |members, centroid| {
             if let Some(prune) = &prune {
                 prune(members, centroid)

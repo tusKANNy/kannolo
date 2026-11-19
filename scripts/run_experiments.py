@@ -203,8 +203,10 @@ def _build_ivf_params(configs, input_file, output_file):
         params.append(f"--kmeans-n-redo {ip['kmeans-n-redo']}")
     if "kmeans-sample-size" in ip:
         params.append(f"--kmeans-sample-size {ip['kmeans-sample-size']}")
-    if ip.get("kmeans-hnsw", False):
-        params.append("--kmeans-hnsw")
+    if "kmeans-ann" in ip:  # auto / on / off
+        params.append(f"--kmeans-ann {ip['kmeans-ann']}")
+    elif ip.get("kmeans-hnsw", False):  # older configs
+        params.append("--kmeans-ann on")
     if ip.get("kmeans-spherical", False):
         params.append("--kmeans-spherical")
     return params

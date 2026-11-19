@@ -1,6 +1,45 @@
 # Changelog
 
-## 0.16.0 - unreleased
+## 0.17.0
+
+### Breaking changes
+
+- **`--kmeans-hnsw` is replaced by `--kmeans-ann auto|on|off`** (default `auto`), and
+  `KMEANS_HNSW_THRESHOLD` (32,768) by `KMEANS_ANN_THRESHOLD`. `run_experiments.py` reads
+  `kmeans-ann` and still maps an old `kmeans-hnsw = true` to `--kmeans-ann on`.
+- **`IVFBuildParams` gains `ann_assignment: AnnAssignment`**, and `prepare_ivf`'s
+  `kmeans_hnsw: bool` parameter is renamed `ann_assignment`.
+- **`prepare_ivf` and `IVF::build_index` require `G::Owned: IvfCentroids`** for the centroid type.
+  It is implemented for the dense (`f32`/`f16`) and sparse (`u16`/`u32`) scalar datasets, under
+  squared Euclidean distance and dot product.
+
+### Added
+
+- `IVF::over_centroids` builds a plain IVF over vectors filed under a given coarse quantizer;
+  `IVF::refile` re-files new vectors under an existing IVF's coarse quantizer.
+  `assign_to_centroids` returns the clustering (`BuildArtifacts`) of a dataset against fixed
+  centroids.
+- `IvfCentroidIndexBuilder` (a vectorium `CentroidIndexBuilder`) and the `IvfCentroids` trait,
+  which use an `IVF` as the centroid index of k-means.
+
+### Changes
+
+- **`auto` turns ANN assignment on from 4,096 clusters** (was 32,768). On SIFT1M, k-means +
+  assignment at 4,096 clusters drops from 17.4 to 4.6 s (Lloyd, 10 epochs) and from 5.0 to 1.6 s
+  (e-means, 2 epochs), with IVF recall@10 unchanged (within 0.2 points at nprobe 4–64). Builds
+  with 4,096–32,767 clusters therefore produce different (approximately assigned) clusters.
+- **The ANN index is chosen by solver.** Lloyd keeps assigning through an HNSW over the
+  centroids, rebuilt every iteration. E-means now assigns through kANNolo's own `IVF` built over
+  the centroids (`IvfCentroidIndexBuilder`): it trains its coarse quantizer once (4·√k lists,
+  rounded up to a power of two) and, after every mini-batch, only re-files the moved
+  centroids. E-means refreshes the index tens of times per epoch, and rebuilding an HNSW each
+  time cost more than the clustering itself (vectorium PR #3, E3). On SIFT1M with 32,768
+  clusters, e-means k-means takes 28.0 s with an HNSW and 5.1 s with the IVF (Lloyd with HNSW:
+  10.6 s). On FiQA ColBERTv2 (65,536 centroids, e-means 2 epochs, nprobe 16), 256, 512 and
+  1,024 lists take 50, 28 and 20 s at about the same clustering error, hence 4·√k lists. The
+  final assignment of every vector still uses an HNSW.
+
+## 0.16.0
 
 Moves to vectorium 0.12.0.
 
