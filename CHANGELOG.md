@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.18.0
+
+### Breaking changes
+
+- **The specific Python classes are removed**: `DensePlainHNSW`, `DensePQHNSW`, `DenseFlatIndex`,
+  `SparsePlainHNSW`, `SparseDotPacking8HNSW`, `SparseFixedU8HNSW`, `SparseFixedU16HNSW`,
+  `SparseFlatIndex`, `DenseRerankHNSW`, `SparseRerankHNSW`, `SparseMultivecRerankIndex` and
+  `SparseMultivecTwoLevelsPQRerankIndex`. Each is now one `kannolo.build` call. For example,
+  `DensePlainHNSW` is `kannolo.build(x, encoder=kannolo.Plain("f16"), index=kannolo.HNSW())`.
+  `SparseFixedU8HNSW` is `encoder=kannolo.FixedPoint(8)`, `SparsePlainHNSW` is
+  `encoder=kannolo.Blocked("f16")`, `DenseRerankHNSW` is an HNSW over `kannolo.PQ`/`kannolo.RaBitQ` with
+  `rerank=kannolo.Rerank(kannolo.Plain("f16"))`, and `SparseRerankHNSW` is `transform=kannolo.L1Prune(p)` with
+  `rerank=kannolo.Rerank(..., residual=True)`. `kannolo.load` does not read index files saved by
+  these classes; rebuild them. ACORN filtered search (`search_filtered`, `build_acorn_gamma`,
+  `search_filtered_gamma`) is now `search(..., filter=..., acorn_gamma=...)` and
+  `Index.build_acorn_gamma`. Not carried over: loading precomputed ColBERTv2 multi-vector
+  artifacts from a folder (`kannolo.TwoLevelPQ` trains its codebooks from the token vectors
+  instead).
+
+### Added
+
+- **Composable Python API**: `kannolo.build(data, metric=..., encoder=..., index=...,
+  rerank=...)` builds any composition of Table 7 of the kANNolo paper. It accepts dense, sparse
+  (`u16`/`u32`) or multi-vector data; `ip`, `l2` or `maxsim`; the `Plain`, `FixedPoint`,
+  `Scalar`, `PQ`, `RaBitQ`, `Blocked`, `DotPacking8` and `TwoLevelPQ` encoders; `Flat`, `HNSW`
+  (`standard`/`permuted`/`compressed` graphs) and `IVF` (flat or HNSW centroids, optional
+  residual clusters) first stages; and an optional `L1Prune` transform. Any number of rescoring
+  stages (`kannolo.Rerank`) can follow, each with its own encoder, metric, representation and
+  data. They give two-stage, hybrid (e.g. sparse → multi-vector) and cascade indexes, including
+  residual rescoring. Data comes from numpy arrays, CSR-style tuples, `scipy.sparse` matrices, lists of
+  token arrays, or `.npy`/`.bin` files. One `Index` class covers every combination: `search`
+  (single query or batch), `save`, `kannolo.load(path)`. `kannolo.check(...)` validates a
+  combination without building it. All stages share one Rust interface, called once per batch
+  of queries, so any first stage composes with any rescoring stage without compiling every
+  pair. The search and rescoring loops are still compiled for the concrete types. See
+  [docs/PythonUsage.md](docs/PythonUsage.md#composable-api).
+- Filtered search with ACORN-1 and ACORN-γ for single-stage HNSW indexes of any
+  representation, encoder and graph layout (before, `DensePlainHNSW` only). The API is
+  `Index.search(..., filter=...)`, with a boolean mask, an id array, a callable or one filter per
+  query, and `Index.build_acorn_gamma(gamma)`. With a mask, batch filtered search runs in
+  parallel.
+- `kannolo.compose(index, rerank=...)`: adds rescoring stages, built from in-memory data, to an
+  existing (built or loaded) index. The new index shares the existing one without copying it.
+  First stages and rescoring datasets can be stored separately and combined at load time.
+- `rerank_index::rerank_candidates` and `rerank_candidates_with_early_exit`: the rescoring of
+  `RerankIndex`, as free functions over any rerank dataset.
+- `IVF::centroid_index`, `IVF::cluster_dataset` and `IVF::metadata_space_usage_bytes`.
+- Cargo features `dense`, `sparse` and `ivf` (with the existing `multivec`) select what the
+  composable Python API compiles. Builds from source with fewer features are smaller and faster
+  to compile. The default Python build enables all of them. `kannolo.compiled_features()` lists
+  what a build contains. Using a part that the build left out raises an error that names the
+  feature.
+- Files written by `Index.save` are self-describing: a header records the spec, so `load` takes only the path and no
+  arguments.
+- The `dev-python` Cargo profile for faster local builds (`maturin develop --profile
+  dev-python`): 16 codegen units, about 3x faster to compile and about 2% slower search.
+  `kannolo.build_profile` names the profile a build used. `import kannolo` warns on a
+  `dev-python` build, so that it is not used for benchmarks by mistake.
+- Notebooks `filtered_search_acorn.ipynb` (post-filtering, ACORN-1 and ACORN-γ on a filtered
+  benchmark) and `compose_indexes.ipynb` (first stages and rescoring stages stored separately and
+  composed). The three existing notebooks use `kannolo.build` and `kannolo.compose`.
+- CI: the `Test Python Package` workflow builds the bindings with `maturin develop --release`,
+  checks the smaller feature builds, and runs the Python tests.
+
+### Changes
+
+- The Python package is now a mixed Rust/Python package: the native module is
+  `kannolo._kannolo`, wrapped by the pure-Python `kannolo` package.
+- The `python` feature no longer depends on `ndarray` and `ndarray-npy` (the `cli` feature still
+  does).
+- `scripts/acorn_benchmark.py` uses the composable API, and turns each predicate into a mask
+  outside the timed region.
+- Python dense PQ (`kannolo.PQ`) is compiled for 8, 16, 32, 64 and 128 subspaces (the removed
+  `DensePQHNSW` took ten counts up to 384). For other code sizes, the error suggests RaBitQ, with
+  1, 2, 4 or 8 bits per component.
+
 ## 0.17.0
 
 ### Breaking changes

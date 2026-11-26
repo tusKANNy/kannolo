@@ -1,594 +1,278 @@
 # Kannolo Python API Reference
 
-Kannolo provides a Python interface for vector search with support for:
-- **Dense indexes**: Plain and PQ-encoded HNSW
-- **Sparse indexes**: Multiple encoding schemes (plain, DotPacking8, FixedU8, FixedU16)
-- **Flat (brute-force) indexes**: Dense and sparse exhaustive search
-- **Multivector reranking**: Two-stage sparse + multivector retrieval
+`kannolo.build` builds an index from independent choices, one per axis: the representation
+(dense, sparse or multi-vector), the metric, the encoder, the index structure (Flat, HNSW or
+IVF) and optional rescoring stages. Every composition in Table 7 of the kANNolo paper is one
+`kannolo.build` call. `kannolo.load` reads any saved index back.
 
-## Imports
+## Composable API
+
+Choose the representation, metric, encoder, index structure and rescoring stages
+independently. The representation (dense, sparse or multi-vector) is inferred from the data.
 
 ```python
-from kannolo import (
-    # Dense HNSW
-    DensePlainHNSW,      # Dense plain HNSW (no quantization)
-    DensePQHNSW,         # Dense product-quantized HNSW
-    DenseFlatIndex,      # Dense exhaustive (brute-force) search
-    
-    # Sparse HNSW
-    SparsePlainHNSW,     # Sparse HNSW, dot product, blocked sparse encoder (f16 values)
-    SparseDotPacking8HNSW,  # Sparse DotPacking8 HNSW (u16 components, fixed-point u8 values)
-    SparseFixedU8HNSW,   # Sparse fixed u8-encoded HNSW
-    SparseFixedU16HNSW,  # Sparse fixed u16-encoded HNSW
-    SparseFlatIndex,     # Sparse exhaustive (brute-force) search
-    
-    # Multivector reranking
-    SparseMultivecRerankIndex,            # Sparse HNSW + Plain multivector rerank
-    SparseMultivecTwoLevelsPQRerankIndex, # Sparse HNSW + Two-level PQ multivector rerank
-
-    # Dense reranking
-    DenseRerankHNSW,     # Compressed dense HNSW + f16 or RaBitQ-ext rerank
-
-    # Sparse reranking
-    SparseRerankHNSW,    # Sparse HNSW over pruned/compressed vectors + rerank with residuals/full vectors
-)
 import numpy as np
-```
+import kannolo
 
-## Index Construction
+data = np.random.randn(10000, 768).astype(np.float32)        # (n, dim)
 
-### HNSW Parameters
-
-All HNSW indexes support:
-- `m` (int): Neighbors per node. Typical: 16–64. Default: 32
-- `ef_construction` (int): Graph construction effort. Higher = better quality, slower. Default: 200
-- `metric` (str): Distance metric. Options: `"euclidean"`, `"dotproduct"` (default)
-- `graph_type` (str): How the graph is stored. Leave it out and you get `"standard"`.
-  See [GraphCompression.md](GraphCompression.md)
-  - `"standard"` (default) — original node order, uncompressed
-  - `"compressed"` — reordered *and* compressed: roughly halves the graph portion of the
-    index and keeps the query speed-up below. Requires `m <= 128`
-  - `"permuted"` — reordered only: faster queries, because nodes that are searched together
-    end up stored together, but no size saving (marginally larger than `"standard"`)
-
-  All three return identical search results; they differ in index size and query speed.
-  Whatever you pass to the builder must be passed again to `load()`: index files are not
-  self-describing, so `load()` cannot detect it for you.
-
-### Dense Plain HNSW
-
-```python
-# From .npy file (dtype=float32)
-index = DensePlainHNSW.build_from_file(
-    "data.npy",
-    m=32,
-    ef_construction=200,
-    metric="dotproduct",
-    graph_type="standard"   # or "compressed" / "permuted"
+index = kannolo.build(
+    data,
+    metric="ip",                                  # default; "l2", or "maxsim" (multi-vector)
+    encoder=kannolo.PQ(subspaces=64),             # default: kannolo.Plain()
+    index=kannolo.HNSW(graph="compressed"),       # m=32, ef_construction=200 by default; or Flat(), IVF(...)
+    rerank=kannolo.Rerank(kannolo.Plain("f16")),  # optional rescoring stage(s)
 )
 
-# From numpy array. The array must be flattened, and `dim` is required:
-# vectors are passed as one contiguous 1-D buffer of n_vectors * dim floats.
-data = np.random.randn(10000, 768).astype(np.float32)
-index = DensePlainHNSW.build_from_array(data.flatten(), dim=768, m=32, ef_construction=200)
+queries = np.random.randn(100, 768).astype(np.float32)
+distances, ids = index.search(queries, k=10, ef_search=100, k_candidates=200)   # (100, 10)
+distances, ids = index.search(queries[0], k=10)                                 # one query: (10,)
+
+index.save("my.index")
+index = kannolo.load("my.index")   # no arguments: the file records how it was built
+print(index)                  # kannolo.Index(n=10000, dim=768, Dense(), metric='ip', ...)
 ```
 
-### Dense PQ HNSW
+### Data
 
-```python
-# Product-quantized dense index
-index = DensePQHNSW.build_from_file(
-    "data.npy",
-    m_pq=32,           # PQ subspaces: 8, 16, 32, 48, 64, 96, 128, 192, 256, 384
-    m=32,              # HNSW neighbors
-    ef_construction=200,
-    metric="dotproduct"
-)
-```
-
-`m_pq` must divide the vector dimensionality. Note that the CLI's `--pq-subspaces` accepts a
-different set (`4` … `192`); `256` and `384` are Python-only, and `4` is CLI-only.
-
-### Dense Flat Index
-
-```python
-# Exhaustive search (no HNSW index, just linear scan)
-index = DenseFlatIndex.build_from_file("data.npy", metric="dotproduct")
-
-# Or from array (flattened, as above)
-data = np.random.randn(10000, 768).astype(np.float32)
-index = DenseFlatIndex.build_from_array(data.flatten(), dim=768, metric="dotproduct")
-```
-
-### Sparse Plain HNSW
-
-Dot product only. The collection is stored with the blocked sparse encoder (`f16` values); the
-graph is built over the plain `f16` collection, which is then re-encoded. There is no `metric`
-argument.
-
-```python
-# From binary file (seismic format)
-index = SparsePlainHNSW.build_from_file(
-    "data.bin",
-    m=32,
-    ef_construction=200,
-)
-
-# From numpy arrays (components and values)
-components = np.array([0, 5, 10, 15], dtype=np.int32)
-values = np.array([0.5, 0.3, 0.8, 0.2], dtype=np.float32)
-offsets = np.array([0, 4], dtype=np.int64)  # one document starting at 0, ending at 4
-
-# Build with these vectors
-index = SparsePlainHNSW.build_from_arrays(
-    components, values, offsets,
-    m=32,
-    ef_construction=200,
-)
-```
-
-### Sparse Variants (DotPacking8, FixedU8, FixedU16)
-
-```python
-# Same interface as SparsePlainHNSW, plus `metric`
-# SparseDotPacking8HNSW replaces SparseDotVByteHNSW (removed with vectorium's DotVByte encoder);
-# it supports only dotproduct and u16 components. Old DotVByte index files must be rebuilt.
-index = SparseDotPacking8HNSW.build_from_file("data.bin", m=32, ef_construction=200)
-index = SparseFixedU8HNSW.build_from_file("data.bin", m=32, ef_construction=200, metric="dotproduct")
-index = SparseFixedU16HNSW.build_from_file("data.bin", m=32, ef_construction=200, metric="dotproduct")
-```
-
-### Sparse Flat Index
-
-```python
-# Exhaustive sparse search
-index = SparseFlatIndex.build_from_file("data.bin")
-
-# Or from arrays
-components = np.array([0, 5, 10], dtype=np.int32)
-values = np.array([0.5, 0.3, 0.8], dtype=np.float32)
-offsets = np.array([0, 3], dtype=np.int64)
-index = SparseFlatIndex.build_from_arrays(components, values, offsets)
-```
-
-### Dense Reranking
-
-A two-stage dense index: a compressed HNSW first stage over PQ / RaBitQ / RaBitQ-ext codes, reranked against the same collection at plain `f16` (the default) or as RaBitQ-ext codes (`rerank_bits`).
-
-The graph is always built over `f16` and only its *dataset* is then replaced by codes, so the compressed representation never takes part in construction. With an `f16` rerank stage the index holds the collection twice, which trades memory for speed, unlike `DensePQHNSW`; RaBitQ-ext rerank codes make the second copy smaller.
-
-```python
-data = np.random.randn(10000, 768).astype(np.float32)
-
-# PQ first stage
-index = DenseRerankHNSW.build_from_array(
-    data.flatten(), dim=768,
-    m=32, ef_construction=200, metric="dotproduct",
-    encoder="pq", pq_subspaces=32,
-)
-
-# RaBitQ-ext first stage: `rabitq_total_bits` is the document code width (2, 4 or 8)
-index = DenseRerankHNSW.build_from_array(
-    data.flatten(), dim=768,
-    encoder="rabitq-ext", rabitq_total_bits=4,
-)
-
-# RaBitQ first stage: `rabitq_query_bits` (1..=8) sets the query-side width
-index = DenseRerankHNSW.build_from_array(
-    data.flatten(), dim=768,
-    encoder="rabitq", rabitq_query_bits=1,
-)
-```
-
-- `encoder` (str): `"pq"`, `"rabitq"` or `"rabitq-ext"`. Default: `"pq"`
-- `pq_subspaces` (int): applies to `"pq"`. Default: 32
-- `rabitq_total_bits` (int): document code width for `"rabitq-ext"`. Default: 4
-- `rabitq_query_bits` (int): query code width for `"rabitq"`. Default: 1
-- `rerank_bits` (int): the rerank stage's encoding. `0` is plain `f16`; `2`, `4` or `8` store
-  RaBitQ-ext codes instead, which shrinks the rerank dataset. Default: 0
-- `residual_rerank` (bool): encode `x - x̂` (what the first stage left out) in the rerank stage
-  and score a candidate as first-stage plus rerank score. Needs `rerank_bits > 0`, a `"rabitq"`
-  or `"rabitq-ext"` first stage, and `metric="dotproduct"`. Default: False
-- `m`, `ef_construction`, `metric`, `graph_type`: as for every HNSW index above
-
-The graph, the first-stage codes and the candidate lists do not depend on `rerank_bits`: only the
-rescoring changes.
-
-```python
-# RaBitQ-ext 4-bit first stage, reranked on 8-bit RaBitQ-ext codes instead of f16
-index = DenseRerankHNSW.build_from_array(
-    data.flatten(), dim=768,
-    encoder="rabitq-ext", rabitq_total_bits=4, rerank_bits=8,
-)
-```
-
-Or straight from a `.npy` collection, where `dim` comes from the file's shape:
-
-```python
-index = DenseRerankHNSW.build_from_file(
-    "data.npy",
-    m=32, ef_construction=200, metric="dotproduct",
-    encoder="pq", pq_subspaces=32,
-)
-```
-
-### Sparse Reranking
-
-A two-stage sparse index (dot product). Both stages are built from one collection: an HNSW
-first stage over a reduced version of each vector, and a rerank stage that rescores its
-candidates. Three build options decide what each stage holds:
-
-- `prune_percentage` (float, in `[0, 100]`, required): the first stage keeps, per vector, the
-  components carrying the top `prune_percentage`% of its L1 mass. 100 means no pruning
-- `first_stage_value_type` (str): `"blocked-sparse"`, `"f16"` or `"fixedu8"`. With
-  `"blocked-sparse"` both stages are stored with the blocked sparse encoder (`f16` values) and the
-  graph is built over the `f16` values; otherwise the rerank stage is `f16`. `graph_type="compressed"`
-  needs `"f16"` or `"fixedu8"`. Default: `"blocked-sparse"`
-- `residual_rerank` (bool): store only the pruned-away components in the rerank stage and score a
-  candidate as first-stage plus rerank score. Needs `prune_percentage < 100`. Default: False
-
-| `prune_percentage` | `residual_rerank` | first stage | index |
+| Representation | Build data | Queries (batch) | One query |
 |---|---|---|---|
-| < 100 | True | `blocked-sparse` or `f16` | L1-pruned first stage, exact rescoring at `f16` precision; each non-zero stored once |
-| < 100 | False | any | pruned first stage, rescored on the full vectors |
-| < 100 | True | `fixedu8` | pruned and quantized first stage; the summed score is approximate |
-| 100 | False | `fixedu8` | quantized first stage, rescored on the full `f16` vectors |
+| dense | 2-D float array `(n, dim)`, or a `.npy` path | 2-D array | 1-D array |
+| sparse | `scipy.sparse` matrix, `(components, values, offsets)`, or a `.bin` (seismic) path | same | `(components, values)` |
+| multi-vector | list of `(n_tokens, dim)` arrays, or `(tokens, lengths)` | same | one `(n_tokens, dim)` array |
 
-`prune_percentage=100` is rejected with `residual_rerank=True` (the residual would be empty) and
-with a `blocked-sparse` or `f16` first stage (the rerank stage would be an identical copy).
+Sparse components need not be sorted within a vector. Repeated components are rejected. Query
+components that no indexed vector has are ignored (they cannot change an inner product).
+
+A sparse `.bin` file uses the seismic binary format, little-endian. It starts with the number of
+vectors as a `u32`. Then, for each vector, it stores the number of nonzeros `n` as a `u32`, the
+`n` components as `u32` (strictly ascending) and the `n` values as `f32`.
+`scripts/convert_npy_arrays_to_bin.py` and `scripts/convert_bin_to_npy_arrays.py` convert between
+this format and `.npy` arrays.
+
+### Options per axis
+
+| Axis | Options |
+|---|---|
+| `representation` | inferred; or `kannolo.Dense()`, `kannolo.Sparse(components="auto" \| "u16" \| "u32")`, `kannolo.MultiVector()` |
+| `metric` | `"ip"` (alias `"dotproduct"`), `"l2"` (squared Euclidean, alias `"euclidean"`), `"maxsim"` (multi-vector). Default: `"ip"`, or `"maxsim"` for multi-vector data |
+| `encoder` | see the table below |
+| `index` | `kannolo.Flat()`, `kannolo.HNSW(m=32, ef_construction=200, graph="standard" \| "permuted" \| "compressed")`, `kannolo.IVF(n_lists=1024, residual=False, centroids=kannolo.Flat() \| kannolo.HNSW(...), ...)` |
+| `transform` | `kannolo.L1Prune(percent)`: the first stage indexes the largest components holding `percent`% of each sparse vector's L1 mass |
+| `rerank` | `kannolo.Rerank(encoder, data=None, metric=None, residual=False)`, or a list of them (a cascade) |
+
+| Encoder | Dense | Sparse | Multi-vector | Notes |
+|---|---|---|---|---|
+| `kannolo.Plain(dtype="f32" \| "f16" \| "bf16")` | ✓ | ✓ (f32, f16) | ✓ (f32, f16) | uncompressed (a cast for f16/bf16) |
+| `kannolo.FixedPoint(bits=8 \| 16)` | ✓ | ✓ | | fixed-point values |
+| `kannolo.Scalar(bits=8 \| 16)` | | ✓ | | one trained step per component |
+| `kannolo.PQ(subspaces)` | ✓ | | ✓ | dense: 8, 16, 32, 64, 128 subspaces (for other code sizes, use RaBitQ); multi-vector: 8, 16, 32, 64 per token; must divide the dimension |
+| `kannolo.RaBitQ(bits=1, seed=42, rotate=True)` | ✓ | | | bits ∈ {1, 2, 4, 8}; dimension a multiple of 64 |
+| `kannolo.Blocked(values="f16" \| "scalar_u8" \| "scalar_u16")` | | ✓ | | inner product, `u16` components |
+| `kannolo.DotPacking8(values=...)` | | ✓ | | inner product; `fixed_u8`, `scalar_u8`, `scalar_u16`, `f16`, `scalar_4bit` |
+| `kannolo.TwoLevelPQ(subspaces=16, n_coarse=1024)` | | | ✓ | coarse centroid + PQ residual per token |
+
+IVF stores dense clusters as `Plain("f32"/"f16")`, `PQ` or `RaBitQ`, optionally as residuals
+against their centroid. It stores sparse clusters as `Plain("f32"/"f16")` (inner product, `u16`).
+IVF is not available for multi-vector data. Its k-means is configured with `kmeans_epochs`,
+`kmeans_sample_size`, `seed`, `spherical` and `n_redo`. `centroid_nnz_factor` prunes sparse
+centroids.
+
+`kannolo.check(...)` validates a combination without building anything. A combination that does
+not exist raises a `ValueError` that says why:
 
 ```python
-from kannolo import SparseRerankHNSW
-
-index = SparseRerankHNSW.build_from_file(
-    "data.bin",                  # Seismic binary format
-    prune_percentage=60.0, residual_rerank=True,
-    m=32, ef_construction=200,
-)
-
-distances, ids = index.search(
-    query_components, query_values,
-    k_candidates=100, k=10, ef_search=100,
-)
+kannolo.check(representation=kannolo.Sparse(), metric="l2", encoder=kannolo.DotPacking8())
+# ValueError: DotPacking8 scores with inner product only; use metric="ip"
 ```
 
-`build_from_arrays(components, values, offsets, ...)` takes the collection as flat arrays, with
-the same options. `batch_search` takes the same arguments plus `num_threads`, with queries in the
-flattened sparse format described under [Search Operations](#search-operations).
+### Rescoring stages
 
-### Multivector Reranking
-
-#### Plain Multivector
+A rescoring stage rescores the candidates of the stage before it. It has its own encoding and
+metric, and optionally its own representation and data. The data must hold the same items in the
+same order as the first stage.
 
 ```python
-# Expects multivec_data_folder with (see MultiVectorUsage.md for the full spec):
-# - documents.npy (shape: [n_tokens, token_dim], dtype: uint16, reinterpreted as f16)
-#   Note: 2-D and token-major. Documents are delimited by doclens, not by a dimension.
-# - doclens.npy (shape: [n_docs], dtype: int32)
+# Dense: 1-bit RaBitQ graph, rescored on f16 (the two-stage index of the paper's Figure 2).
+index = kannolo.build(x, encoder=kannolo.RaBitQ(1), index=kannolo.HNSW(m=16, graph="permuted"),
+                 rerank=kannolo.Rerank(kannolo.Plain("f16")))
 
-index = SparseMultivecRerankIndex.build_from_file(
-    sparse_index_path="sparse_index_file",
-    multivec_data_folder="/path/to/multivec_data_folder"
-)
+# Hybrid: sparse first stage, rescored with multi-vector MaxSim.
+index = kannolo.build(splade_docs, encoder=kannolo.DotPacking8(), index=kannolo.HNSW(),
+                 rerank=kannolo.Rerank(kannolo.TwoLevelPQ(16), data=colbert_docs))
+index.search(splade_queries, k=10, rerank_queries=colbert_queries, k_candidates=100)
+
+# Residuals: the first stage holds 60% of each vector's L1 mass, the rescoring stage the rest.
+index = kannolo.build(splade_docs, encoder=kannolo.Blocked(), index=kannolo.HNSW(),
+                 transform=kannolo.L1Prune(60), rerank=kannolo.Rerank(kannolo.Plain("f16"), residual=True))
+
+# Cascade: RaBitQ(1) graph -> 8-bit RaBitQ -> f32.
+index = kannolo.build(x, encoder=kannolo.RaBitQ(1), index=kannolo.HNSW(),
+                 rerank=[kannolo.Rerank(kannolo.RaBitQ(8)), kannolo.Rerank(kannolo.Plain("f32"))])
+index.search(q, k=10, k_candidates=[400, 50])
 ```
 
-#### Two-Level PQ Multivector
+`residual=True` stores what the first stage leaves out, and scores a candidate as the sum of the
+two stages. For sparse data, the residual is the components `L1Prune` dropped. For dense data with
+a Flat or HNSW first stage, it is `x - x̂`, where `x̂` is the first stage's RaBitQ reconstruction.
+Residuals support inner product only.
+
+### Composing an index from separately built parts
+
+`kannolo.compose(index, rerank=...)` adds rescoring stages to an existing index, either built or
+loaded. The rescoring stages are built from in-memory data, in the same input formats as `build`.
+The index is shared without copying and is left unchanged. One first stage can therefore be
+combined with several rescoring datasets. For example, three stored first stages and one stored
+collection, rescored with three encoders, give nine indexes in memory:
 
 ```python
-# Expects doclens.npy as above, and instead of documents.npy:
-# - centroids.npy       (shape: [n_coarse_centroids, token_dim], dtype: float32)
-# - pq_centroids.npy    (shape: [M * 256 * dsub], dtype: float32, dsub = token_dim / M)
-# - residuals.npy       (shape: [n_tokens, M], dtype: uint8 -- PQ codes)
-# - index_assignment.npy (shape: [n_tokens], dtype: uint64)
-# - residual_norms.npy  (shape: [n_tokens], dtype: float32) -- optional, picked up if present
+firsts = [kannolo.load(p) for p in ("hnsw_rabitq.index", "hnsw_pq.index", "ivf.index")]
+data = np.load("collection.npy")
+encoders = [kannolo.Plain("f32"), kannolo.Plain("f16"), kannolo.RaBitQ(bits=8)]
+indexes = [kannolo.compose(f, kannolo.Rerank(e, data=data)) for f in firsts for e in encoders]
 
-index = SparseMultivecTwoLevelsPQRerankIndex.build_from_file(
-    sparse_index_path="sparse_index.bin",
-    multivec_data_folder="/path/to/multivec_data",
-    pq_subspaces=32  # Must be 8, 16, 32, or 64
-)
+# Hybrid: a sparse first stage with multi-vector rescoring
+sparse_first = kannolo.load("sparse_first.index")
+hybrid = kannolo.compose(sparse_first, kannolo.Rerank(kannolo.TwoLevelPQ(subspaces=16), data=(tokens, doclens)))
 ```
 
----
+Each `Rerank` needs its `data`, which holds the same items in the same order as the index. For
+`residual=True`, `data` is the first stage's original collection. The residual is computed from it
+in the same way as in `build`. Composing onto an index that already has rescoring stages appends a
+stage (a cascade). A composed index saves and loads like any other, as one file.
 
-## Save / Load
+### Filtered search (ACORN)
 
-```python
-# Save any index
-index.save("my_index.bin")
-
-# Load (must specify metric for types that support it)
-index = DensePlainHNSW.load("my_index.bin", metric="dotproduct")
-index = SparsePlainHNSW.load("my_index.bin")
-index = DensePQHNSW.load("my_index.bin", m_pq=32, metric="dotproduct")
-
-# HNSW indexes built with a non-default graph type must be loaded with the same one
-index = DensePlainHNSW.load("my_index.bin", metric="dotproduct", graph_type="compressed")
-
-# Flat indexes
-index = DenseFlatIndex.load("my_index.bin", metric="dotproduct")
-index = SparseFlatIndex.load("my_index.bin")  # dot product only, nothing to disambiguate
-
-# Two-stage indexes save both stages to the one file
-index = DenseRerankHNSW.load(
-    "my_index.bin",
-    metric="dotproduct", graph_type="standard",
-    encoder="pq", pq_subspaces=32,
-)
-index = SparseRerankHNSW.load(
-    "my_index.bin", first_stage_value_type="f16", graph_type="standard", residual_rerank=True,
-)
-index = SparseMultivecRerankIndex.load("my_index.bin")
-index = SparseMultivecTwoLevelsPQRerankIndex.load("my_index.bin", pq_subspaces=32)
-```
-
-Every index type supports `save` / `load`.
-
-Index files carry no header or type tag, so whatever you passed at build time must be passed
-again to `load`: a mismatch decodes into garbage or fails outright rather than reporting itself.
-
-For `DenseRerankHNSW` two arguments behave differently from the rest:
-
-- `rabitq_total_bits` is **not** accepted by `load` — it is stored with the encoder and comes
-  back with the index.
-- `rabitq_query_bits` **is** accepted, and is free to differ from the build-time value: it
-  describes how a query is processed and touches nothing that was stored. One saved index
-  therefore serves every query width, and `set_query_bits` can change it again afterwards
-  without saving anything.
-- `rerank_bits` must be `0` for an index built with the `f16` rerank stage and `2`, `4` or `8`
-  otherwise (the exact width is stored), and `residual_rerank` must match the build.
-
-For the two-stage classes, `save`/`load` round-trips the index as it stands, whereas
-`build_from_file` reconstructs it from a first-stage index plus the original dataset — so
-`load` avoids re-reading and re-encoding the rerank data.
-
----
-
-## Search Operations
-
-Every index exposes **two** methods, and they are not interchangeable:
-
-- **`search(...)`** — one query. Dense indexes take a 1-D array of exactly `dim` floats and
-  raise `ValueError` otherwise; sparse indexes take one `(components, values)` pair and take
-  **no** `offsets` argument.
-- **`batch_search(...)`** — many queries at once, optionally in parallel. Dense indexes take
-  all queries concatenated into one flat array; sparse indexes take the concatenated
-  `components`/`values` plus an `offsets` array delimiting each query.
-
-Both return `(distances, ids)` as two 1-D numpy arrays. **Results are always padded to `k`**:
-if fewer than `k` neighbors are found, the remainder is filled with `inf` distances and `-1`
-ids. `batch_search` returns `num_queries * k` entries, query-major.
-
-Returned ids are always ids into your original dataset, whatever `graph_type` you built with.
-
-### `num_threads` (batch only)
-
-- `0` (default) — rayon's default pool, typically every core.
-- `1` — a plain serial loop with no rayon involvement. Use this to reproduce single-threaded
-  benchmarks that pin the process with `numactl --physcpubind`.
-- `n` — a temporary pool of `n` threads for the duration of the call.
-
-### Dense indexes (`DensePlainHNSW`, `DensePQHNSW`)
+`filter=` returns only the neighbors a filter allows. On an HNSW index, ACORN applies the filter
+during the graph traversal and does not post-filter the results. Recall therefore stays high when
+few vectors qualify. Filtered search currently applies only to single-stage HNSW indexes (any
+representation, encoder and graph layout). Other indexes raise `ValueError`.
 
 ```python
-# Single query: a 1-D array of exactly `dim` floats.
-query = np.random.randn(768).astype(np.float32)
-dists, ids = index.search(query, k=10, ef_search=200)
+allowed = prices < 100                              # a boolean mask over the collection
+dists, ids = index.search(queries, k=10, filter=allowed)
+index.search(queries, k=10, filter=np.array([3, 17, 42]))   # or the allowed ids
+index.search(queries, k=10, filter=lambda i: i % 2 == 0)    # or a callable, evaluated once per id
+index.search(queries, k=10, filter=[mask_q0, mask_q1, ...]) # or one filter per query
 
-# With early exit threshold (optional, suggested 0.005-0.25)
-dists, ids = index.search(query, k=10, ef_search=200, early_exit_threshold=0.1)
-
-# Many queries: flatten them into a single contiguous buffer.
-queries = np.random.randn(100, 768).astype(np.float32)
-dists, ids = index.batch_search(queries.flatten(), k=10, ef_search=200, num_threads=0)
-# dists and ids each hold 100 * 10 entries, query-major.
-```
-
-`DensePQHNSW.search` has no default arguments: pass `ef_search` and `early_exit_threshold`
-explicitly.
-
-### Dense Flat Index
-
-```python
-query = np.random.randn(768).astype(np.float32)
-dists, ids = index.search(query, k=10)
-
-queries = np.random.randn(100, 768).astype(np.float32)
-dists, ids = index.batch_search(queries.flatten(), k=10, num_threads=0)
-```
-
-### Sparse HNSW (`SparsePlainHNSW`, `SparseDotPacking8HNSW`, `SparseFixedU8HNSW`, `SparseFixedU16HNSW`)
-
-```python
-# Single query: components and values only, no offsets.
-query_components = np.array([0, 5, 10], dtype=np.int32)
-query_values = np.array([0.8, 0.5, 0.3], dtype=np.float32)
-dists, ids = index.search(query_components, query_values, k=10, ef_search=200)
-
-# Many queries: concatenate them and delimit with offsets.
-query_components = np.array([0, 5, 10, 100, 200], dtype=np.int32)
-query_values = np.array([0.8, 0.5, 0.3, 0.7, 0.2], dtype=np.float32)
-offsets = np.array([0, 3, 5], dtype=np.int64)  # Two queries: [0,3) and [3,5)
-
-dists, ids = index.batch_search(
-    query_components, query_values, offsets,
-    k=10, ef_search=200,
-    early_exit_threshold=0.1,   # optional
-    num_threads=0,
-)
-```
-
-### Sparse Flat Index
-
-```python
-query_components = np.array([0, 5, 10], dtype=np.int32)
-query_values = np.array([0.8, 0.5, 0.3], dtype=np.float32)
-dists, ids = index.search(query_components, query_values, k=10)
-
-# Batch form takes offsets.
-offsets = np.array([0, 3], dtype=np.int64)
-dists, ids = index.batch_search(query_components, query_values, offsets, k=10, num_threads=0)
-```
-
-### Dense Reranking (`DenseRerankHNSW`)
-
-```python
-query = np.random.randn(768).astype(np.float32)
-
-dists, ids = index.search(
-    query,
-    k=10,                       # Final results
-    k_candidates=100,           # First-stage candidates passed to reranking (frontier knob)
-    ef_search=100,              # First-stage candidate list size
-    alpha=0.3,                  # Candidate pruning (optional)
-    beta=None,                  # Rerank early exit (optional)
-    early_exit_threshold=None,  # First-stage distance-adaptive early exit (optional)
-)
-```
-
-`k_candidates` is the knob to sweep: it sets how many first-stage candidates get reranked
-against the rerank stage. `ef_search` is usually a multiple of it. `alpha` keeps only
-candidates whose first-stage score is within a relative slack of the k-th best.
-
-#### Sweeping the RaBitQ query width
-
-Under `encoder="rabitq"` the query-side bit width can be changed on a live index:
-
-```python
-index = DenseRerankHNSW.build_from_array(data.flatten(), dim=768, encoder="rabitq")
-
-for bits in (1, 2, 4, 8):
-    index.set_query_bits(bits)
-    dists, ids = index.search(query, k=10, k_candidates=100, ef_search=100)
-```
-
-The width only affects how a *query* is processed and leaves the stored codes at the width they
-were encoded with, so one index serves every width — a width ladder is a set of search
-arguments, not a set of separate builds of byte-identical indexes. Results are identical to
-those from an index built at that width.
-
-It raises `ValueError` for a width outside `1..=8`, and for `encoder="pq"` or
-`encoder="rabitq-ext"`, whose queries are not quantized at all, rather than silently doing
-nothing.
-
-The width is **not** part of the saved index — see Save / Load above — so a reloaded index
-starts at whatever `rabitq_query_bits` was passed to `load`, regardless of what was set when it
-was saved.
-
-The batch form takes the queries flattened into one contiguous buffer and returns query-major
-results:
-
-```python
-queries = np.random.randn(100, 768).astype(np.float32)
-
-dists, ids = index.batch_search(
-    queries.flatten(),
-    k=10, k_candidates=100, ef_search=100,
-    num_threads=0,   # 0 = every core, 1 = serial, n = that many
-)
-# dists and ids each hold 100 * 10 entries
-```
-
-### Sparse Multivector Reranking
-
-The single-query form takes `multivec_query` (singular) and no offsets:
-
-```python
-query_components = np.array([0, 5, 10, 100], dtype=np.int32)
-query_values = np.array([0.8, 0.5, 0.3, 0.7], dtype=np.float32)
-
-# One query: 8 tokens of 768 dimensions, flattened.
-multivec_query = np.random.randn(8, 768).astype(np.float32).reshape(-1)
-
-dists, ids = index.search(
-    query_components, query_values, multivec_query,
-    n_tokens=8,
-    token_dim=768,
-    k_candidates=25,   # First-stage candidates
-    k=10,              # Final results
-    ef_search=100,
-    alpha=0.05,        # First-stage weight (optional)
-    beta=2,            # Second-stage early exit (optional)
-    residuals=False,   # Sum first- and second-stage scores (optional)
-)
-```
-
-`residuals=True` scores each candidate as `first_stage_score + rerank_score` instead of the rerank
-score alone, for setups where the rerank dataset holds the residual part of a decomposed
-representation. Nothing checks that the two scores are summable — that is on the caller.
-
-The batch form adds `sparse_offsets` and takes `multivec_queries` (plural):
-
-```python
-sparse_offsets = np.array([0, 4], dtype=np.int64)  # One query
-multivec_queries = np.random.randn(1, 8, 768).astype(np.float32).reshape(-1)
-
-dists, ids = index.batch_search(
-    query_components, query_values, sparse_offsets, multivec_queries,
-    n_tokens=8, token_dim=768,
-    k_candidates=25, k=10, ef_search=100,
-    num_threads=0,
-    residuals=False,   # Sum first- and second-stage scores (optional)
-)
-```
-
----
-
-## Index Size
-
-`DensePlainHNSW` and `DenseRerankHNSW` report the bytes they hold:
-
-```python
-index.space_usage_bytes()
-```
-
-This is the library's own accounting over the dataset and every graph level, not a
-resident-set measurement — pair it with process RSS/USS if you need both.
-
-## Filtered Search (ACORN)
-
-Predicate-aware search — "the `k` nearest neighbors for which `predicate(id)` is true" — is
-available on **`DensePlainHNSW` only**. It is not a post-filter: the predicate steers the
-graph traversal, so recall stays usable even when few vectors qualify.
-
-The predicate is a Python callable receiving an original dataset id and returning `bool`.
-It is invoked during traversal, so keep it cheap.
-
-```python
-# ACORN-1: two-hop expansion computed on the fly. Nothing to prepare.
-dists, ids = index.search_filtered(query, k=10, predicate=lambda i: i % 2 == 0, ef_search=100)
-
-# ACORN-gamma: precompute the expansion once, then search repeatedly.
-# Trades memory for speed; gamma of 2-4 is a sensible starting point.
+# ACORN-γ: precompute expanded neighbor lists once, for very selective filters
 index.build_acorn_gamma(gamma=3)
-dists, ids = index.search_filtered_gamma(query, k=10, predicate=lambda i: i % 2 == 0, ef_search=100)
+index.search(queries, k=10, filter=allowed)                    # now uses ACORN-γ
+index.search(queries, k=10, filter=allowed, acorn_gamma=False) # ACORN-1
 ```
 
-`build_acorn_gamma` must be called before `search_filtered_gamma`, which otherwise raises
-`RuntimeError`. The expanded lists live on the index object in memory and are **not** written
-by `save()`: call `build_acorn_gamma` again after `load()`.
+ACORN-1 expands two-hop neighbors on the fly and needs no preparation. With very selective
+filters (around 1% of the collection), its recall drops. ACORN-γ is meant for this case. The
+ACORN-γ neighbor lists cost memory and build time (a `gamma` of 2–4 is a good starting value).
+`save` does not write them, so call `build_acorn_gamma` again after `load`. A callable filter is
+evaluated in Python for every id before the search, so pass a mask when you filter repeatedly.
+With a mask, batch filtered search runs on every core.
 
----
+### Search parameters
 
-## Index Selection Guide
+`index.search(queries, k=10, *, rerank_queries=None, ef_search=None, nprobe=None,
+early_exit_threshold=None, query_bits=None, k_candidates=None, alpha=None, beta=None,
+rerank_query_bits=None, filter=None, acorn_gamma=None, num_threads=0)`
 
-| Use Case | Index | Notes |
-|----------|-------|-------|
-| Dense vectors, high accuracy | `DensePlainHNSW` | Default choice |
-| Dense vectors, memory limited | `DensePQHNSW` | Quantized, faster search |
-| Dense vectors, ground truth/exhaustive search | `DenseFlatIndex` | Exhaustive, exact neighbors |
-| Sparse vectors, standard | `SparsePlainHNSW` | Blocked sparse encoding (`f16` values), dot product |
-| Sparse vectors, memory limited | `SparseFixedU8HNSW` or `SparseDotPacking8HNSW` | Compressed |
-| Sparse vectors, ground truth/exhaustive search | `SparseFlatIndex` | Exhaustive, exact |
-| Dense vectors, compressed first stage + rerank | `DenseRerankHNSW` | Compressed HNSW + `f16` or RaBitQ-ext rerank |
-| Sparse vectors, pruned or quantized first stage + rerank | `SparseRerankHNSW` | L1-pruned HNSW + residual or full-vector rerank |
-| Multivector retrieval | `SparseMultivecRerankIndex` | Sparse first-stage + multivec rerank |
-| Multivector + quantization | `SparseMultivecTwoLevelsPQRerankIndex` | Sparse + PQ rerank |
+| Parameter | Applies to | Default |
+|---|---|---|
+| `ef_search` | HNSW first stage, IVF with HNSW centroids | 100 |
+| `early_exit_threshold` | the same (distance-adaptive termination, λ) | off |
+| `nprobe` | IVF first stage | 16 |
+| `query_bits` | first stage with `RaBitQ(bits=1)` (query quantized to 1–8 bits) | 1 |
+| `k_candidates` | each rescoring stage (value or list) | `max(10k, 100)` |
+| `alpha` | each rescoring stage: candidate pruning | off |
+| `beta` | each rescoring stage: early exit after `beta` stalls | off |
+| `rerank_query_bits` | rescoring stage with `RaBitQ(bits=1)` | 1 |
+| `rerank_queries` | rescoring stages in another representation (a dict if several) | — |
+| `filter` | single-stage HNSW: filtered search (see [Filtered search](#filtered-search-acorn)) | off |
+| `acorn_gamma` | filtered search: ACORN-γ (`True`) or ACORN-1 (`False`) | ACORN-γ once built |
+| `num_threads` | `0`: every core, `1`: serial, `n`: `n` threads | 0 |
 
----
+A parameter that does not apply to the index raises a `ValueError`. Missing results (fewer than
+`k` candidates) are padded with distance `inf` and id `-1`. Under `"l2"`, an IVF reports
+`‖q − x‖² − ‖q‖²`. It leaves out the term that is constant for the query, so the ranking is still
+exact.
+
+### Properties
+
+`len(index)`, `index.dim` (the first stage's; the token dimension for multi-vector data),
+`index.nbytes` (bytes held by every stage) and `index.spec` (the `kannolo.IndexSpec` it was built with).
+
+### Table 7 of the paper, row by row
+
+Every composition in Table 7 of the kANNolo paper is one `kannolo.build` call. `python/tests/test_table7.py`
+builds each of them and checks it against an exact ground truth.
+
+| Table 7 row | `kannolo.build(...)` |
+|---|---|
+| Dense, Flat, scalar / PQ / RaBitQ | `index=kannolo.Flat(), encoder=kannolo.Plain("f16")` / `kannolo.PQ(m)` / `kannolo.RaBitQ(b)` |
+| Dense, Flat, PQ or RaBitQ + rescoring | `index=kannolo.Flat(), encoder=kannolo.PQ(m), rerank=kannolo.Rerank(kannolo.Plain())` |
+| Dense, HNSW, scalar / PQ / RaBitQ | `index=kannolo.HNSW(), encoder=...` |
+| HNSWPQ + refine, HNSW-RaBitQ | `index=kannolo.HNSW(), encoder=kannolo.PQ(m)` or `kannolo.RaBitQ(1)`, `rerank=kannolo.Rerank(kannolo.Plain("f16"))` (or PQ, RaBitQ) |
+| IVFFlat, IVFPQ, IVF-HNSW, IVF-RaBitQ | `index=kannolo.IVF(n_lists, centroids=kannolo.Flat() \| kannolo.HNSW(), residual=...), encoder=kannolo.Plain() \| kannolo.PQ(m) \| kannolo.RaBitQ(b)` |
+| IVF + rescoring | the same, plus `rerank=kannolo.Rerank(...)` |
+| Sparse, Flat / HNSW, scalar / blocked / DotPacking8 | `index=kannolo.Flat()` or `kannolo.HNSW()`, `encoder=kannolo.Plain() \| kannolo.FixedPoint() \| kannolo.Scalar() \| kannolo.Blocked() \| kannolo.DotPacking8()` |
+| Sparse, IVF | `index=kannolo.IVF(...), encoder=kannolo.Plain("f32" \| "f16")` |
+| Sparse + scalar rescoring | `rerank=kannolo.Rerank(kannolo.Plain())` |
+| Sparse, top-a% of L1 mass, scalar or blocked residuals | `transform=kannolo.L1Prune(a), rerank=kannolo.Rerank(kannolo.Plain("f16") \| kannolo.Blocked(), residual=True)` |
+| Multi-vector, Flat / HNSW, scalar / PQ / two-level PQ | `index=kannolo.Flat()` or `kannolo.HNSW()`, `encoder=kannolo.Plain() \| kannolo.PQ(m) \| kannolo.TwoLevelPQ(m)` |
+| Multi-vector + rescoring | `rerank=kannolo.Rerank(kannolo.Plain())` (or PQ, two-level PQ) |
+| Hybrid: sparse → dense / multi-vector; dense → multi-vector | `rerank=kannolo.Rerank(encoder, data=other_representation)`, searched with `rerank_queries=` |
+| Cascade | `rerank=[kannolo.Rerank(...), kannolo.Rerank(...)]` |
+
+Not available from Python: an IVF as the centroid index of an IVF (`centroids=kannolo.IVF(...)`),
+and IVF over sparse clusters stored as DotPacking8.
+
+### Building a smaller library
+
+Every combination is compiled ahead of time, so the library contains all of them. The published
+wheels contain all of them. A build from source can leave out what it does not need with the Cargo
+features `dense`, `sparse`, `multivec` and `ivf`. The default Python build enables all four:
+
+| Feature | Adds |
+|---|---|
+| `dense` | dense data: Flat, HNSW and rescoring stages over dense vectors |
+| `sparse` | sparse data: Flat, HNSW and rescoring stages over sparse vectors |
+| `multivec` | multi-vector data, scored with MaxSim. In practice an add-on to `sparse` or `dense`: multi-vector data is mostly used as the rescoring stage of a hybrid pipeline |
+| `ivf` | IVF first stages, for whichever of `dense` and `sparse` is enabled |
+
+```bash
+# Sparse indexes (Flat, HNSW, rescoring), no IVF:
+maturin build --release --no-default-features --features python,sparse
+# A sparse first stage rescored with multi-vector MaxSim (the hybrid pipeline):
+maturin build --release --no-default-features --features python,sparse,multivec
+# Dense HNSW/Flat and IVF:
+maturin build --release --no-default-features --features python,dense,ivf
+```
+
+`kannolo.compiled_features()` lists what a build contains. Building, loading or searching something
+the build left out raises a `ValueError` that names the feature to enable. Index files have the
+same format in every build. Any build that contains a representation reads the files of that
+representation written by any other build.
+
+### Performance
+
+Every stage is compiled ahead of time and fully specialized. The index is dispatched once per
+stage in each `search` call. The search loops, rescoring loops and distance kernels are the same
+code that a Rust program runs. Stages are combined at run time, so any first stage composes with
+any rescoring dataset without compiling every pair.
+
+A file written by `Index.save` starts with a small header that holds the spec, followed by the
+payload of each stage. The CLI binaries (`hnsw_build`, `ivf_build`, ...) write their own
+headerless files. `kannolo.load` does not read these files, and the CLI binaries do not read
+the files with a header.
 
 ## Additional Resources
 
-- **Notebooks**: See [notebooks/](../notebooks/) for end-to-end examples
+- **Notebooks** in [notebooks/](../notebooks/):
+  - `dense_euclidean_benchmark.ipynb`, `sparse_plain_benchmark.ipynb`: ground truth with a Flat
+    index, then an HNSW swept over `ef_search` and early termination
+  - `sparse_multivec_rerank_benchmark.ipynb`: a sparse first stage composed with multi-vector
+    (MaxSim) rescoring, evaluated with `ir_measures`
+  - `filtered_search_acorn.ipynb`: post-filtering, ACORN-1 and ACORN-γ on a filtered benchmark
+  - `compose_indexes.ipynb`: three first stages and three rescoring encodings, stored as parts and
+    composed into nine indexes
+
 - **Rust API**: See [RustUsage.md](RustUsage.md)
 - **Running Experiments**: See [RunExperiments.md](RunExperiments.md)

@@ -63,36 +63,42 @@ Dense, two-stage: an HNSW over 1-bit RaBitQ codes retrieves 100 candidates, and 
 
 ```python
 import numpy as np
-from kannolo import DenseRerankHNSW
+import kannolo
 
 data = np.random.randn(100_000, 768).astype(np.float32)
-index = DenseRerankHNSW.build_from_array(
-    data.flatten(), dim=768, metric="dotproduct",
-    m=32, ef_construction=200,
-    encoder="rabitq",            # or "pq", "rabitq-ext"
+index = kannolo.build(
+    data,
+    metric="ip",                                     # or "l2"
+    # Encoders, with the code size of a d-dimensional vector:
+    #   Plain("f32"), Plain("f16"), Plain("bf16"): 4d or 2d bytes (no compression)
+    #   PQ(subspaces=M): M bytes, with M = 8, 16, 32, 64 or 128
+    #   RaBitQ(bits=b): about b*d/8 bytes, with b = 1, 2, 4 or 8
+    encoder=kannolo.RaBitQ(bits=1),
+    index=kannolo.HNSW(),                            # defaults: m=32, ef_construction=200
+    rerank=kannolo.Rerank(kannolo.Plain("f16")),
 )
 
-query = data[42]
-dists, ids = index.search(query, k=10, k_candidates=100, ef_search=100)
+dists, ids = index.search(data[42], k=10, k_candidates=100, ef_search=100)
 index.save("dense.idx")
+index = kannolo.load("dense.idx")                     # the file records how it was built
 ```
 
 Sparse: the first stage keeps the components that carry the top 60% of each vector's L1 mass, and
 the pruned-away residual restores the exact score when a candidate is rescored.
 
 ```python
-from kannolo import SparseRerankHNSW
-
-index = SparseRerankHNSW.build_from_file(
-    "documents.bin",             # Seismic binary format
-    prune_percentage=60.0, residual_rerank=True,
-    m=32, ef_construction=500,
+index = kannolo.build(
+    "documents.bin",                             # seismic binary format, or numpy/scipy arrays
+    encoder=kannolo.Blocked(),
+    index=kannolo.HNSW(),
+    transform=kannolo.L1Prune(60),
+    rerank=kannolo.Rerank(kannolo.Plain("f16"), residual=True),
 )
-dists, ids = index.search(query_components, query_values, k=10, k_candidates=100, ef_search=100)
+dists, ids = index.search((query_components, query_values), k=10, k_candidates=100, ef_search=100)
 ```
 
-Single-stage indexes (`DensePlainHNSW`, `DensePQHNSW`, `SparsePlainHNSW`, …), flat indexes,
-batch search, graph compression and early termination are covered in
+Every other composition (single-stage, Flat and IVF indexes, multi-vector and hybrid pipelines,
+cascades, graph compression, batch search) is one `kannolo.build` call, covered in
 [`docs/PythonUsage.md`](docs/PythonUsage.md).
 
 ## What's inside
@@ -151,8 +157,9 @@ compiler vectorizes for your CPU, and without this flag they fall back to baseli
 | Feature | What it enables | Default |
 |---------|-----------------|:-------:|
 | `cli` | Binaries: `hnsw_build`, `hnsw_search`, `hnsw_rerank_{build,search}_{dense,sparse}`, `ivf_build`, `ivf_search` | No |
-| `multivec` | Multi-vector reranking (`SparseMultivecRerankIndex`, `SparseMultivecTwoLevelsPQRerankIndex`); with `cli`, also `hnsw_rerank_search` | No |
+| `multivec` | Multi-vector data (Vectorium's multi-vector encoders); in the Python bindings, multi-vector stages; with `cli`, also `hnsw_rerank_search` | No |
 | `python` | PyO3 bindings, enabled automatically by maturin | No |
+| `dense`, `sparse`, `ivf` | Which representations and index types the Python bindings compile (the Python build enables all of them; see [Building a smaller library](docs/PythonUsage.md#building-a-smaller-library)) | No |
 
 ```bash
 RUSTFLAGS="-C target-cpu=native" cargo build --release                          # library only
@@ -164,8 +171,10 @@ Binaries land in `target/release/`. [`docs/Binaries.md`](docs/Binaries.md) docum
 
 ## Installing the Python package
 
-`pip install kannolo` installs a prebuilt wheel with every index: dense, sparse, two-stage and
-sparse + multi-vector reranking. If no wheel matches your platform, pip compiles from source.
+`pip install kannolo` installs a prebuilt wheel with every index: dense, sparse, multi-vector,
+two-stage and hybrid. If no wheel matches your platform, pip compiles from source. A build from
+source can also leave out the representations you do not need, which gives a smaller library;
+see [Building a smaller library](docs/PythonUsage.md#building-a-smaller-library).
 
 **For maximum performance, build from source for your CPU** (requires Rust nightly via
 [`rustup`](https://rustup.rs); the repository pins the toolchain):
@@ -179,8 +188,17 @@ RUSTFLAGS="-C target-cpu=native" pip install --no-binary :all: kannolo
 ```bash
 git clone https://github.com/TusKANNy/kannolo.git && cd kannolo
 pip install maturin
-RUSTFLAGS="-C target-cpu=native" maturin develop --release
+RUSTFLAGS="-C target-cpu=native" maturin develop --release                # as the published wheels
+RUSTFLAGS="-C target-cpu=native" maturin develop --profile dev-python     # faster to compile
 ```
+
+The `dev-python` profile splits the code into 16 codegen units. It compiles about 3x faster
+(under 3 minutes instead of about 8, on a 32-core machine), which helps while changing the code.
+However, LLVM can no longer inline across units, and **search is about 2% slower**.
+
+> **For benchmarks and papers, always build with the release profile** (`--release` or `pip
+> install`, which use `codegen-units = 1`). `import kannolo` warns when the installed build is a
+> `dev-python` one, and `kannolo.build_profile` tells which profile built it.
 
 ## Documentation
 

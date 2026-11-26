@@ -72,9 +72,9 @@ Options:
 
 A two-stage index has an HNSW first stage that retrieves `--k-candidates` candidates and a rerank
 dataset that rescores them. The build binaries take one collection, build both stages, and save
-them to one file; the search binaries load that file. The files are the same ones the Python
-classes `DenseRerankHNSW` and `SparseRerankHNSW` save and load, so either side can build and the
-other search.
+them to one file; the search binaries load that file. In Rust, `kannolo::rerank::DenseRerankIndex`
+and `SparseRerankIndex` read and write the same files. (The Python package builds these indexes
+with `kannolo.build` and saves them in its own self-describing format.)
 
 Index files carry no header, so the search binary must be given the build options that select the
 index type: they are listed for each pair below.
