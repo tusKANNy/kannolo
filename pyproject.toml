@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kannolo"
-version = "0.17.0"
+version = "0.18.0"
 description = "Python interface for the kANNolo library"
 requires-python = ">=3.9"
 classifiers = [
@@ -32,4 +32,6 @@ dependencies = [
 ]
 
 [tool.maturin]
-features = ["python", "multivec"]
+features = ["python", "dense", "sparse", "multivec", "ivf"]
+python-source = "python"
+module-name = "kannolo._kannolo"

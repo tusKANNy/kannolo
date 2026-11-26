@@ -1,0 +1,51 @@
+name: Test Python Package
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test-python:
+    runs-on: ubuntu-latest
+    # The release build compiles every index combination on one codegen unit, and the tests build
+    # and search a few hundred small indexes.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest and newest supported versions
+        python-version: ["3.10", "3.13"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@nightly
+
+    - name: Check smaller builds of the bindings (Cargo features dense, sparse, multivec, ivf)
+      run: |
+        for features in python python,dense python,sparse python,multivec python,dense,ivf python,sparse,ivf python,sparse,multivec; do
+          echo "::group::$features"
+          cargo check --release --no-default-features --features "$features" --lib
+          echo "::endgroup::"
+        done
+
+    - name: Build and install kannolo (release profile, as the published wheels)
+      run: |
+        python -m venv .venv
+        source .venv/bin/activate
+        pip install maturin numpy pytest
+        RUSTFLAGS="-C target-cpu=native" maturin develop --release
+
+    - name: Run the Python tests
+      run: |
+        source .venv/bin/activate
+        python -c "import kannolo; print('kannolo', sorted(kannolo.compiled_features()))"
+        pytest -v python/tests

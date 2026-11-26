@@ -1,6 +1,6 @@
 [package]
 name = "kannolo"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 license = "MIT"
 description = "kANNolo is designed for easy prototyping of ANN Search algorithms while ensuring high effectiveness and efficiency over both dense and sparse vectors."
@@ -30,13 +30,21 @@ pyo3        = { version = "0.29.0", features = ["extension-module"], optional = 
 numpy       = { version = "0.29.0", optional = true }
 ndarray     = { version = "0.16", optional = true }
 ndarray-npy = { version = "0.9", optional = true }
+serde_json  = { version = "1", optional = true }
 
 
 [features]
 default      = []
 use-libxsmm  = []
 multivec     = ["vectorium/multivec"]
-python       = ["dep:pyo3", "dep:numpy", "dep:ndarray", "dep:ndarray-npy"]
+python       = ["dep:pyo3", "dep:numpy", "dep:serde_json"]
+# Select what the composable Python API (`kannolo.build`) compiles. A build without a
+# representation is smaller and faster to compile. Asking it for that representation raises an
+# error that names the missing feature. The default Python build (pyproject.toml) enables all of
+# them, together with `multivec`.
+dense = ["python"]
+sparse = ["python"]
+ivf = ["python"]
 cli          = ["dep:clap", "dep:ndarray", "dep:ndarray-npy"]
 
 [[bin]]
@@ -95,3 +103,11 @@ lto = false
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# Faster local builds while developing (`maturin develop --profile dev-python`). With 16 codegen
+# units the Python bindings compile about 3x faster, but search is about 2% slower because LLVM
+# cannot inline across units. Never use it for benchmarks: `import kannolo` warns when it was
+# built with this profile.
+[profile.dev-python]
+inherits = "release"
+codegen-units = 16
