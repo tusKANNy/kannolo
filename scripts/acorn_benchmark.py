@@ -3,7 +3,8 @@
 ACORN-1 filtered ANN search benchmark using the Qdrant filtered ANN benchmark datasets.
 
 Downloads a small dataset (100K vectors with metadata predicates), builds a standard
-DensePlainHNSW index, runs filtered search via ACORN-1, and reports recall and latency.
+HNSW index (kannolo.build), runs filtered search via ACORN-1 and ACORN-γ, and reports recall
+and latency.
 
 Usage:
     python acorn_benchmark.py                          # laion-small-clip (default)
@@ -218,7 +219,7 @@ def search_post_filter(
     query: np.ndarray,
     k: int,
     ef_search: int,
-    predicate,
+    allowed: np.ndarray,
 ) -> list[int]:
     """
     Standard HNSW search followed by predicate filtering.
@@ -227,8 +228,8 @@ def search_post_filter(
     then keeps only those satisfying the predicate. This is the naive baseline:
     cheap to implement, but recall collapses when the predicate is selective.
     """
-    _distances, ids = index.search(query, ef_search, ef_search)
-    passing = [int(i) for i in ids if predicate(int(i))]
+    _distances, ids = index.search(query, ef_search, ef_search=ef_search)
+    passing = [int(i) for i in ids if i >= 0 and allowed[i]]
     return passing[:k]
 
 
@@ -237,11 +238,11 @@ def search_acorn1(
     query: np.ndarray,
     k: int,
     ef_search: int,
-    predicate,
+    allowed: np.ndarray,
 ) -> list[int]:
     """ACORN-1 filtered search (two-hop expansion during graph traversal)."""
-    _distances, ids = index.search_filtered(query, k, ef_search, predicate)
-    return [int(i) for i in ids]
+    _distances, ids = index.search(query, k, ef_search=ef_search, filter=allowed, acorn_gamma=False)
+    return [int(i) for i in ids if i >= 0]
 
 
 def search_acorn_gamma(
@@ -249,11 +250,11 @@ def search_acorn_gamma(
     query: np.ndarray,
     k: int,
     ef_search: int,
-    predicate,
+    allowed: np.ndarray,
 ) -> list[int]:
     """ACORN-γ filtered search (pre-expanded neighbor lists, no two-hop at query time)."""
-    _distances, ids = index.search_filtered_gamma(query, k, ef_search, predicate)
-    return [int(i) for i in ids]
+    _distances, ids = index.search(query, k, ef_search=ef_search, filter=allowed, acorn_gamma=True)
+    return [int(i) for i in ids if i >= 0]
 
 
 def run_all_benchmarks(
@@ -304,10 +305,13 @@ def run_all_benchmarks(
         for i, test in enumerate(tests[:n_queries]):
             query = np.array(test["query"], dtype=np.float32)
             ground_truth = set(test["closest_ids"][:k])
+            # Evaluate the predicate once, outside the timed region, as a mask over the collection.
+            # The search reads the mask.
             predicate = build_predicate(test["conditions"], payloads)
+            allowed = np.fromiter((predicate(i) for i in range(len(payloads))), dtype=bool, count=len(payloads))
 
             t0 = time.perf_counter()
-            result_ids = search_fn(query, predicate)
+            result_ids = search_fn(query, allowed)
             elapsed_ms = (time.perf_counter() - t0) * 1000
             latencies_ms.append(elapsed_ms)
 
@@ -409,12 +413,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     print(f"Building HNSW (M={args.m}, ef_construction={args.ef_construction}) ...")
     t0 = time.perf_counter()
-    index = kannolo.DensePlainHNSW.build_from_array(
-        vectors.flatten(),
-        dim,
-        m=args.m,
-        ef_construction=args.ef_construction,
+    index = kannolo.build(
+        vectors.astype(np.float32),
         metric=ds_info["metric"],
+        encoder=kannolo.Plain("f16"),
+        index=kannolo.HNSW(m=args.m, ef_construction=args.ef_construction),
     )
     build_time = time.perf_counter() - t0
     print(f"Index built in {build_time:.1f}s\n")

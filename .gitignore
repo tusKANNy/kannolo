@@ -279,3 +279,7 @@ $RECYCLE.BIN/
 
 # Notebooks for personal tests
 /other_notebooks
+
+# Data the notebooks download or write next to themselves
+notebooks/acorn_data/
+notebooks/compose_data/
