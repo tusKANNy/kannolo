@@ -181,6 +181,24 @@ where
         self.residual
     }
 
+    /// The centroid index that routes a query to its clusters.
+    pub fn centroid_index(&self) -> &CI {
+        &self.centroid_index
+    }
+
+    /// The dataset holding every cluster's vectors (or residuals), cluster by cluster.
+    pub fn cluster_dataset(&self) -> &D {
+        &self.dataset
+    }
+
+    /// Bytes of the metadata other than the clusters and the centroid index: cluster offsets,
+    /// external ids and L2 correction terms.
+    pub fn metadata_space_usage_bytes(&self) -> usize {
+        self.cluster_offsets.len() * std::mem::size_of::<u32>()
+            + self.external_ids.len() * std::mem::size_of::<u32>()
+            + self.correction_terms.as_ref().map_or(0, |c| c.len() * 4)
+    }
+
     pub fn print_space_usage_bytes(&self) {
         let offsets = self.cluster_offsets.len() * std::mem::size_of::<u32>();
         let ids = self.external_ids.len() * std::mem::size_of::<u32>();

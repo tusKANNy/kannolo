@@ -1,5 +1,5 @@
 //! Two-stage sparse search over an index written by `hnsw_rerank_build_sparse` (or by
-//! `SparseRerankHNSW.save` in Python).
+//! `SparseRerankIndex::save` in Rust).
 //!
 //! Index files carry no header, so `--first-stage-value-type`, `--graph-type` and
 //! `--residual-rerank` must match the build.

@@ -196,20 +196,6 @@ where
         }
     }
 
-    /// Reranks a given list of candidates using the rerank dataset.
-    ///
-    /// This method takes candidate IDs (typically from a graph index search) and
-    /// reranks them using the high-quality rerank dataset.
-    ///
-    /// # Arguments
-    /// - `rerank_query`: Query vector for reranking
-    /// - `candidates`: List of vector IDs from initial search
-    /// - `k_final`: Number of final results to return
-    /// - `first_stage_scores`: First-stage scores of `candidates`, in the same order, when residual
-    ///   reranking is on; `None` to score by the rerank dataset alone
-    ///
-    /// # Returns
-    /// Vector of scored vectors, sorted by distance using the Distance type's Ord implementation
     fn rerank_candidates<'q>(
         &self,
         rerank_query: <RerankDataset::Encoder as VectorEncoder>::QueryVector<'q>,
@@ -221,32 +207,14 @@ where
     where
         <RerankDataset::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
     {
-        debug_assert!(first_stage_scores.is_none_or(|s| s.len() == candidates.len()));
-
-        // Create query evaluator for the rerank dataset
-        let encoder = self.rerank_dataset.encoder();
-        let query_evaluator = encoder.query_evaluator(rerank_query, rerank_search_params);
-
-        // Rerank candidates by computing exact distances
-        let mut reranked: Vec<ScoredVector<<RerankDataset::Encoder as VectorEncoder>::Distance>> =
-            candidates
-                .iter()
-                .enumerate()
-                .map(|(i, vector_id)| {
-                    let encoded_vector = self.rerank_dataset.get(*vector_id);
-                    let distance = query_evaluator.compute_distance(encoded_vector);
-                    ScoredVector {
-                        distance: add_first_stage_score(distance, first_stage_scores.map(|s| s[i])),
-                        vector: *vector_id,
-                    }
-                })
-                .collect();
-
-        // Sort by distance using the Distance type's Ord implementation and take top k_final
-        reranked.sort_by_key(|b| b.distance);
-        reranked.truncate(k_final);
-
-        reranked
+        rerank_candidates(
+            &self.rerank_dataset,
+            rerank_query,
+            rerank_search_params,
+            candidates,
+            k_final,
+            first_stage_scores,
+        )
     }
 
     fn rerank_candidates_with_early_exit<'q>(
@@ -261,63 +229,15 @@ where
     where
         <RerankDataset::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
     {
-        debug_assert!(first_stage_scores.is_none_or(|s| s.len() == candidates.len()));
-
-        // Ensure there are enough candidates
-        if candidates.len() < k_final {
-            return Vec::new();
-        }
-
-        let encoder = self.rerank_dataset.encoder();
-        let query_evaluator = encoder.query_evaluator(rerank_query, rerank_search_params);
-
-        // Rerank first k_final candidates
-        let first_reranked: Vec<ScoredVector<<RerankDataset::Encoder as VectorEncoder>::Distance>> =
-            candidates[..k_final]
-                .iter()
-                .enumerate()
-                .map(|(i, vector_id)| {
-                    let encoded_vector = self.rerank_dataset.get(*vector_id);
-                    let distance = query_evaluator.compute_distance(encoded_vector);
-                    ScoredVector {
-                        distance: add_first_stage_score(distance, first_stage_scores.map(|s| s[i])),
-                        vector: *vector_id,
-                    }
-                })
-                .collect();
-
-        // Create a max heap to keep track of the top k_final candidates
-        let mut heap: BinaryHeap<
-            ScoredVector<<RerankDataset::Encoder as VectorEncoder>::Distance>,
-        > = BinaryHeap::from(first_reranked);
-
-        let mut n_stalls = 0;
-        for (i, vector_id) in candidates[k_final..].iter().enumerate() {
-            let encoded_vector = self.rerank_dataset.get(*vector_id);
-            let distance = query_evaluator.compute_distance(encoded_vector);
-            let candidate = ScoredVector {
-                distance: add_first_stage_score(
-                    distance,
-                    first_stage_scores.map(|s| s[k_final + i]),
-                ),
-                vector: *vector_id,
-            };
-
-            if let Some(mut worst) = heap.peek_mut() {
-                if candidate.distance < worst.distance {
-                    *worst = candidate;
-                    n_stalls = 0;
-                } else {
-                    n_stalls += 1;
-                    if n_stalls >= beta {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Extract results from heap
-        heap.into_sorted_vec()
+        rerank_candidates_with_early_exit(
+            &self.rerank_dataset,
+            rerank_query,
+            rerank_search_params,
+            candidates,
+            k_final,
+            beta,
+            first_stage_scores,
+        )
     }
 
     /// Returns a reference to the underlying first-stage index.
@@ -339,6 +259,135 @@ where
     pub fn is_empty(&self) -> bool {
         self.rerank_dataset.is_empty()
     }
+}
+
+// Rescoring, shared by `RerankIndex` and the composable Python bindings, which pair a
+// first stage of any type with a rerank dataset.
+
+/// Rescores `candidates` against `dataset` and returns the best `k_final`.
+///
+/// This is the rescoring step of [`RerankIndex::search`], and it works with any rerank dataset.
+/// It scores the candidate IDs (typically from a first-stage index search) with the dataset's
+/// encoder.
+///
+/// # Arguments
+/// - `rerank_query`: Query vector for reranking
+/// - `candidates`: List of vector IDs from initial search
+/// - `k_final`: Number of final results to return
+/// - `first_stage_scores`: First-stage scores of `candidates`, in the same order, when residual
+///   reranking is on; `None` to score by the rerank dataset alone
+///
+/// # Returns
+/// Vector of scored vectors, sorted by distance using the Distance type's Ord implementation
+pub fn rerank_candidates<'q, RerankDataset>(
+    dataset: &RerankDataset,
+    rerank_query: <RerankDataset::Encoder as VectorEncoder>::QueryVector<'q>,
+    rerank_search_params: &<RerankDataset::Encoder as VectorEncoder>::QueryParams,
+    candidates: &[VectorId],
+    k_final: usize,
+    first_stage_scores: Option<&[f32]>,
+) -> Vec<ScoredVector<<RerankDataset::Encoder as VectorEncoder>::Distance>>
+where
+    RerankDataset: Dataset,
+    <RerankDataset::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
+{
+    debug_assert!(first_stage_scores.is_none_or(|s| s.len() == candidates.len()));
+
+    // Create query evaluator for the rerank dataset
+    let encoder = dataset.encoder();
+    let query_evaluator = encoder.query_evaluator(rerank_query, rerank_search_params);
+
+    // Rerank candidates by computing exact distances
+    let mut reranked: Vec<ScoredVector<<RerankDataset::Encoder as VectorEncoder>::Distance>> =
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(i, vector_id)| {
+                let encoded_vector = dataset.get(*vector_id);
+                let distance = query_evaluator.compute_distance(encoded_vector);
+                ScoredVector {
+                    distance: add_first_stage_score(distance, first_stage_scores.map(|s| s[i])),
+                    vector: *vector_id,
+                }
+            })
+            .collect();
+
+    // Sort by distance using the Distance type's Ord implementation and take top k_final
+    reranked.sort_by_key(|b| b.distance);
+    reranked.truncate(k_final);
+
+    reranked
+}
+
+/// Like [`rerank_candidates`], but stops after `beta` consecutive candidates fail to enter the
+/// top `k_final` (early-exit reranking). Returns no results when there are fewer than `k_final`
+/// candidates.
+pub fn rerank_candidates_with_early_exit<'q, RerankDataset>(
+    dataset: &RerankDataset,
+    rerank_query: <RerankDataset::Encoder as VectorEncoder>::QueryVector<'q>,
+    rerank_search_params: &<RerankDataset::Encoder as VectorEncoder>::QueryParams,
+    candidates: &[VectorId],
+    k_final: usize,
+    beta: usize,
+    first_stage_scores: Option<&[f32]>,
+) -> Vec<ScoredVector<<RerankDataset::Encoder as VectorEncoder>::Distance>>
+where
+    RerankDataset: Dataset,
+    <RerankDataset::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
+{
+    debug_assert!(first_stage_scores.is_none_or(|s| s.len() == candidates.len()));
+
+    // Ensure there are enough candidates
+    if candidates.len() < k_final {
+        return Vec::new();
+    }
+
+    let encoder = dataset.encoder();
+    let query_evaluator = encoder.query_evaluator(rerank_query, rerank_search_params);
+
+    // Rerank first k_final candidates
+    let first_reranked: Vec<ScoredVector<<RerankDataset::Encoder as VectorEncoder>::Distance>> =
+        candidates[..k_final]
+            .iter()
+            .enumerate()
+            .map(|(i, vector_id)| {
+                let encoded_vector = dataset.get(*vector_id);
+                let distance = query_evaluator.compute_distance(encoded_vector);
+                ScoredVector {
+                    distance: add_first_stage_score(distance, first_stage_scores.map(|s| s[i])),
+                    vector: *vector_id,
+                }
+            })
+            .collect();
+
+    // Create a max heap to keep track of the top k_final candidates
+    let mut heap: BinaryHeap<ScoredVector<<RerankDataset::Encoder as VectorEncoder>::Distance>> =
+        BinaryHeap::from(first_reranked);
+
+    let mut n_stalls = 0;
+    for (i, vector_id) in candidates[k_final..].iter().enumerate() {
+        let encoded_vector = dataset.get(*vector_id);
+        let distance = query_evaluator.compute_distance(encoded_vector);
+        let candidate = ScoredVector {
+            distance: add_first_stage_score(distance, first_stage_scores.map(|s| s[k_final + i])),
+            vector: *vector_id,
+        };
+
+        if let Some(mut worst) = heap.peek_mut() {
+            if candidate.distance < worst.distance {
+                *worst = candidate;
+                n_stalls = 0;
+            } else {
+                n_stalls += 1;
+                if n_stalls >= beta {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Extract results from heap
+    heap.into_sorted_vec()
 }
 
 /// Search parameters of a [`RerankIndex`] used through the [`Index`] trait.

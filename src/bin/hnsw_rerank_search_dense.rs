@@ -1,5 +1,5 @@
 //! Two-stage dense search over an index written by `hnsw_rerank_build_dense` (or by
-//! `DenseRerankHNSW.save` in Python).
+//! `DenseRerankIndex::save` in Rust).
 //!
 //! Index files carry no header, so `--encoder`, `--pq-subspaces`, `--distance`, `--graph-type`,
 //! `--residual-rerank` and whether `--rerank-bits` is zero must match the build.

@@ -8,8 +8,8 @@
 //! Both are built from one collection and saved and loaded as one file. Both implement
 //! [`vectorium::Index`], with [`RerankSearchParams`] as search parameters, and
 //! [`vectorium::IndexStats`]. The dense index is generic over its metric, `DotProduct` or
-//! `SquaredEuclideanDistance`. The Python classes `DenseRerankHNSW` and `SparseRerankHNSW` and the
-//! `hnsw_rerank_{build,search}_{dense,sparse}` binaries are built on them.
+//! `SquaredEuclideanDistance`. The `hnsw_rerank_{build,search}_{dense,sparse}` binaries are built on
+//! them.
 //!
 //! ```no_run
 //! use kannolo::rerank::{
