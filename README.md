@@ -4,8 +4,8 @@
 </p>
 
 <p align="center">
-    <a href="https://arxiv.org/abs/2611.03927"><img src="https://badgen.net/static/arXiv/2611.03927/red" /></a>
     <a href="https://arxiv.org/abs/2501.06121"><img src="https://badgen.net/static/paper/ECIR 2025/yellow" /></a>
+    <a href="https://arxiv.org/abs/2611.03927"><img src="https://badgen.net/static/arXiv/2611.03927/red" /></a>
 </p>
 
 <p align="center">
