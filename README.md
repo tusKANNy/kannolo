@@ -220,28 +220,10 @@ versions, configurations and instructions that reproduce the results of our pape
 
 ## 📚 Bibliography
 
-1. Silvio Martinico, Franco Maria Nardini, Cosimo Rulli and Rossano Venturini. "*Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo*." arXiv:2611.03927. 2026. Submitted to *Information Systems*.
-2. Leonardo Delfino, Domenico Erriquez, Silvio Martinico, Franco Maria Nardini, Cosimo Rulli and Rossano Venturini. "*kANNolo: Sweet and Smooth Approximate k-Nearest Neighbors Search*." Proc. ECIR. 2025.
+1. Leonardo Delfino, Domenico Erriquez, Silvio Martinico, Franco Maria Nardini, Cosimo Rulli and Rossano Venturini. "*kANNolo: Sweet and Smooth Approximate k-Nearest Neighbors Search*." Proc. ECIR. 2025.
+2. Silvio Martinico, Franco Maria Nardini, Cosimo Rulli and Rossano Venturini. "*Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo*." arXiv:2611.03927. 2026. Submitted to *Elsevier Information Systems*.
 
-### Citation
-If you use kANNolo for your work (whether be it a research paper, dissertation, article, poster, presentation, or documentation), please cite our papers:
-
-arXiv 2026 (submitted to *Information Systems*):
-
-```bibtex
-@misc{martinico2026modularefficientapproximatenearest,
-      title={Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo},
-      author={Silvio Martinico and Franco Maria Nardini and Cosimo Rulli and Rossano Venturini},
-      year={2026},
-      eprint={2611.03927},
-      archivePrefix={arXiv},
-      primaryClass={cs.IR},
-      url={https://arxiv.org/abs/2611.03927},
-}
-```
-
-ECIR 2025:
-
+ECIR 2025
 ```bibtex
 @InProceedings{10.1007/978-3-031-88717-8_29,
 author =    "Leonardo Delfino and
@@ -258,3 +240,19 @@ pages =     "400--406",
 isbn =      "978-3-031-88717-8"
 }
 ```
+
+arXiv 2026 (currently submitted to *Elsevier Information Systems*):
+```bibtex
+@misc{martinico2026modularefficientapproximatenearest,
+      title={Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo},
+      author={Silvio Martinico and Franco Maria Nardini and Cosimo Rulli and Rossano Venturini},
+      year={2026},
+      eprint={2611.03927},
+      archivePrefix={arXiv},
+      primaryClass={cs.IR},
+      url={https://arxiv.org/abs/2611.03927},
+}
+```
+
+### Citation License
+The source code in this repository is subject to the following citation license: **By downloading and using this software, you agree to cite the papers listed in the Bibliography section above in any kind of material you produce where it was used to conduct a search or experimentation, whether it be a research paper, dissertation, article, poster, presentation, or documentation. By using this software, you have agreed to the citation license.**
