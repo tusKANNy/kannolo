@@ -57,6 +57,7 @@ kANNolo's indexes are in-memory and static, built once over a fixed collection: 
 disk-based indexes, or insertions and
 deletions after construction, look elsewhere for now.
 
+
 ## Quick start (Python)
 
 Dense, two-stage: an HNSW over 1-bit RaBitQ codes retrieves 100 candidates, and the `f16` vectors rescore them.
@@ -101,6 +102,7 @@ Every other composition (single-stage, Flat and IVF indexes, multi-vector and hy
 cascades, graph compression, batch search) is one `kannolo.build` call, covered in
 [`docs/PythonUsage.md`](docs/PythonUsage.md).
 
+
 ## What's inside
 
 | | |
@@ -111,6 +113,7 @@ cascades, graph compression, batch search) is one `kannolo.build` call, covered 
 | **Metrics** | inner product · squared Euclidean · MaxSim |
 | **Graph storage** | `standard` · `permuted` (cache-friendly node order) · `compressed` (StreamVByte + Elias–Fano; roughly halves the edges memory) |
 | **Interfaces** | Rust library · Python bindings · command-line build/search tools |
+
 
 ## Rust
 
@@ -169,6 +172,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --features "cli,multivec"
 
 Binaries land in `target/release/`. [`docs/Binaries.md`](docs/Binaries.md) documents every flag.
 
+
 ## Installing the Python package
 
 `pip install kannolo` installs a prebuilt wheel with every index: dense, sparse, multi-vector,
@@ -199,6 +203,7 @@ However, LLVM can no longer inline across units, and **search is about 2% slower
 > **For benchmarks and papers, always build with the release profile** (`--release` or `pip
 > install`, which use `codegen-units = 1`). `import kannolo` warns when the installed build is a
 > `dev-python` one, and `kannolo.build_profile` tells which profile built it.
+
 
 ## Documentation
 
@@ -256,6 +261,7 @@ ArXiv 2026 (Submitted to *Elsevier Information Systems*):
 
 ### Citation License
 The source code in this repository is subject to the following citation license: **By downloading and using this software, you agree to cite the papers listed in the Bibliography section above in any kind of material you produce where it was used to conduct a search or experimentation, whether it be a research paper, dissertation, article, poster, presentation, or documentation. By using this software, you have agreed to the citation license.**
+
 
 ## License
 This software is released under the **MIT License** (see [LICENSE](LICENSE)).
