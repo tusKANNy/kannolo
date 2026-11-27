@@ -58,7 +58,7 @@ disk-based indexes, or insertions and
 deletions after construction, look elsewhere for now.
 
 
-## Quick start (Python)
+## Quick Start (Python)
 
 Dense, two-stage: an HNSW over 1-bit RaBitQ codes retrieves 100 candidates, and the `f16` vectors rescore them.
 
@@ -103,7 +103,7 @@ cascades, graph compression, batch search) is one `kannolo.build` call, covered 
 [`docs/PythonUsage.md`](docs/PythonUsage.md).
 
 
-## What's inside
+## What's Inside
 
 | | |
 |---|---|
@@ -173,7 +173,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --features "cli,multivec"
 Binaries land in `target/release/`. [`docs/Binaries.md`](docs/Binaries.md) documents every flag.
 
 
-## Installing the Python package
+## Installing the Python Package
 
 `pip install kannolo` installs a prebuilt wheel with every index: dense, sparse, multi-vector,
 two-stage and hybrid. If no wheel matches your platform, pip compiles from source. A build from
@@ -187,7 +187,7 @@ see [Building a smaller library](docs/PythonUsage.md#building-a-smaller-library)
 RUSTFLAGS="-C target-cpu=native" pip install --no-binary :all: kannolo
 ```
 
-**Development build** (editable install from a clone):
+**Development Build** (editable install from a clone):
 
 ```bash
 git clone https://github.com/TusKANNy/kannolo.git && cd kannolo
@@ -217,7 +217,7 @@ However, LLVM can no longer inline across units, and **search is about 2% slower
 format. [`scripts/`](scripts/) converts between the two.
 
 
-## Reproducing our papers
+## Reproducing our Papers
 
 kANNolo keeps evolving, so this repository does not track the exact setup of any paper. The
 versions, configurations and instructions that reproduce the results of our papers are in
