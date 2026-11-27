@@ -1,7 +1,7 @@
-<h1>
-    <img height="100" align="center" alt="" src="https://silviom97.github.io/assets/img/logos/kannolo.webp" />
-    &nbsp;&nbsp;&nbsp;kANNolo
-</h1>
+<h1 align="center">kANNolo</h1>
+<p align="center">
+    <img height="200px" align="center" alt="" src="https://silviom97.github.io/assets/img/logos/kannolo.webp" />
+</p>
 
 <p align="center">
     <a href="https://arxiv.org/abs/2611.03927"><img src="https://badgen.net/static/arXiv/2611.03927/red" /></a>
