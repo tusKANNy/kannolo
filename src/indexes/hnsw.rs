@@ -158,6 +158,15 @@ pub struct HNSWSearchConfiguration<P = ()> {
     /// The size of the dynamic candidate list for searching the graph.
     /// Also known as `ef` or `efSearch` in the HNSW paper. A larger
     /// value leads to more accurate results at the cost of speed.
+    ///
+    /// In [`Index::search`], `ef_search` may be smaller than `k`. The search then explores with
+    /// beam width `ef_search` and returns the best `k` nodes it scored, also those that never
+    /// entered the beam. A two-stage index can then pass more first-stage candidates to the
+    /// rerank stage than the beam holds. Without a rerank stage, the results after the first
+    /// `ef_search` come from a narrower exploration than with `ef_search = k`. If the search
+    /// would stop after scoring fewer than `k` nodes, it explores further until it has `k`. It
+    /// returns fewer than `k` nodes only when fewer than `k` nodes are reachable. The filtered
+    /// searches still raise `ef_search` to `k`.
     pub ef_search: usize,
     /// Early termination strategy for search.
     pub early_termination: EarlyTerminationStrategy,
@@ -829,17 +838,12 @@ where
         };
 
         // Perform the final, most extensive search on the ground level.
-        // Ensure that `ef_search` is at least `k` to guarantee we can return `k` results.
-        let ef = search_params.ef_search.max(k);
+        // `ef_search` may be smaller than `k`. The search explores with beam width `ef_search`
+        // and returns the best `k` nodes it scored (see `GraphTrait::beam_search`).
+        let ef = search_params.ef_search.max(1);
         let lambda = search_params.early_termination.lambda();
-        let mut topk = ground_graph.greedy_search_topk(
-            &self.dataset,
-            ground_entry_node,
-            &query_eval,
-            k,
-            ef,
-            lambda,
-        );
+        let mut topk =
+            ground_graph.beam_search(&self.dataset, ground_entry_node, &query_eval, k, ef, lambda);
 
         // Map local IDs to global vector IDs and return scored vectors
         topk.drain(..)
@@ -1751,6 +1755,82 @@ mod permute_compress_tests {
             .with_ef_construction(40);
 
         HNSW::build_index(dataset, &config)
+    }
+
+    /// Properties of the ground-level query search (`beam_search`), for every `lambda`.
+    /// The data is a full-precision pseudo-random stream, so distances do not tie.
+    /// - With `ef` at least the number of nodes, the search is exact (the graph is connected).
+    /// - It returns `min(k, n)` results, sorted.
+    /// - `k` does not change which nodes are explored. It only sets how many scored nodes are
+    ///   returned, so the results for `k > ef` start with the results for `k = ef`. This holds
+    ///   while the search scores at least `k` nodes on its own, as it does on this data.
+    ///   Otherwise it explores further to reach `k`.
+    #[test]
+    fn beam_search_properties() {
+        let (n, dim) = (3000, 16);
+        let mut x = 7u64;
+        let mut next = || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let flat: Vec<f32> = (0..n * dim).map(|_| next()).collect();
+        let queries: Vec<f32> = (0..30 * dim).map(|_| next()).collect();
+        let encoder = PlainDenseQuantizer::<f32, SquaredEuclideanDistance>::new(dim);
+        let dataset = DenseDataset::from_raw(flat.into_boxed_slice(), n, encoder);
+        let config = HNSWBuildConfiguration::default()
+            .with_num_neighbors(8)
+            .with_ef_construction(40);
+        let hnsw: PlainHnsw = HNSW::build_index(dataset, &config);
+        let ground = hnsw.levels.last().unwrap();
+        let ids = |v: &[ScoredItemGeneric<SquaredEuclideanDistance, usize>]| {
+            v.iter().map(|r| r.vector).collect::<Vec<_>>()
+        };
+
+        for q in queries.chunks_exact(dim) {
+            let eval = hnsw
+                .dataset
+                .encoder()
+                .query_evaluator(DenseVectorView::new(q), &());
+            let entry = ScoredItemGeneric {
+                distance: eval
+                    .compute_distance(hnsw.dataset.get(ground.get_external_id(0) as VectorId)),
+                vector: 0usize,
+            };
+            let mut exact: Vec<ScoredItemGeneric<SquaredEuclideanDistance, usize>> = (0..n)
+                .map(|local| ScoredItemGeneric {
+                    distance: eval.compute_distance(
+                        hnsw.dataset.get(ground.get_external_id(local) as VectorId),
+                    ),
+                    vector: local,
+                })
+                .collect();
+            exact.sort();
+
+            for lambda in [0.0, 0.01, 0.05, 0.2, 1.0] {
+                let full = ground.beam_search(&hnsw.dataset, entry, &eval, 20, n, lambda);
+                assert_eq!(ids(&full), ids(&exact[..20]), "ef = n, lambda={lambda}");
+
+                for (k, ef) in [
+                    (10, 5),
+                    (20, 10),
+                    (40, 30),
+                    (40, 40),
+                    (20, 60),
+                    (80, 20),
+                    (1, 1),
+                ] {
+                    let res = ground.beam_search(&hnsw.dataset, entry, &eval, k, ef, lambda);
+                    assert_eq!(res.len(), k.min(n), "k={k} ef={ef} lambda={lambda}");
+                    assert!(res.windows(2).all(|w| w[0].distance <= w[1].distance));
+                    if k > ef {
+                        let base = ground.beam_search(&hnsw.dataset, entry, &eval, ef, ef, lambda);
+                        assert_eq!(ids(&res[..ef]), ids(&base), "k={k} ef={ef} lambda={lambda}");
+                    }
+                }
+            }
+        }
     }
 
     /// Same dataset and parameters as [`build_test_hnsw`], built over the fixed-stride backend.

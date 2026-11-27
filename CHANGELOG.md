@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.18.1
+
+- **`ef_search` may be smaller than `k`** in the HNSW search. The search explores with beam width
+  `ef_search` and returns the best `k` nodes it scored, also those that never entered the beam. A
+  two-stage index can then rerank more candidates than the beam holds. If the search scores fewer
+  than `k` nodes, it keeps expanding until it has `k`. The filtered searches still raise
+  `ef_search` to `k`.
+- **Faster graph search**: the beam search keeps its state in one sorted array. With early
+  termination (`lambda > 0`), the candidates outside the array that may still be expanded go to a
+  small heap. It is 3–13% faster without early termination and on par with it, with the same
+  results apart from ties.
+- **Breaking (Rust)**: `GraphTrait::greedy_search_topk` is renamed `GraphTrait::beam_search`.
+
 ## 0.18.0
 
 ### Breaking changes

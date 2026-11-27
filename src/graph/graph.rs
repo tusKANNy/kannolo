@@ -109,25 +109,26 @@ pub trait GraphTrait {
         }
     }
 
-    /// Performs a greedy search on the graph to find the top `k` nearest neighbors.
-    /// It uses a beam search-like approach, maintaining a list of candidates to visit (`ef`)
-    /// and returning the `k` best results found.
+    /// Performs a beam search on the graph and returns the `k` best nodes it scored, sorted by
+    /// distance.
     ///
     /// # Arguments
     /// * `dataset`: The dataset containing the vectors.
-    /// * `starting_node`: The candidate from which the search begins.
+    /// * `entry_node`: The node where the search starts, with its distance to the query.
     /// * `query_evaluator`: An evaluator that can compute distances to the query.
-    /// * `k`: The number of nearest neighbors to return.
-    /// * `ef`: The size of the dynamic candidate list during the search.
-    /// * `lambda`: Relaxation parameter used for adaptive early stopping/admission.
+    /// * `k`: The number of nodes to return.
+    /// * `ef`: The beam width. It may be smaller than `k`.
+    /// * `lambda`: Relaxation of the exit threshold for adaptive termination (`0.0` = none).
     ///
     /// # Returns
-    /// A `Vec` containing tuples of `(distance, id)` for the `k` nearest neighbors.
+    /// A `Vec` of `(distance, id)` items with local ids, sorted by distance. With `ef < k`, they
+    /// include scored nodes that never entered the beam. Fewer than `k` items are returned only
+    /// when fewer than `k` nodes are reachable.
     #[must_use]
-    fn greedy_search_topk<'e, D>(
+    fn beam_search<'e, D>(
         &self,
         dataset: &'e D,
-        starting_node: ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>,
+        entry_node: ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>,
         query_evaluator: &<D::Encoder as VectorEncoder>::Evaluator<'e>,
         k: usize,
         ef: usize,
@@ -137,78 +138,133 @@ pub trait GraphTrait {
         D: Dataset + Sync,
         <D::Encoder as VectorEncoder>::Distance: Distance,
     {
-        let top_candidates = self.search_candidates_for_query(
-            dataset,
-            starting_node,
-            query_evaluator,
-            ef,
-            k,
-            lambda,
-        );
+        type Dist<D> = <<D as Dataset>::Encoder as VectorEncoder>::Distance;
+        let ef = ef.max(1);
+        let cap = k.max(ef);
 
-        let mut top_k = top_candidates.into_sorted_vec();
-        top_k.truncate(k);
-        top_k
+        // The best `cap` nodes scored so far, sorted by distance. The beam is the first `ef`.
+        let mut pool: Vec<ScoredItemGeneric<Dist<D>, usize>> = Vec::with_capacity(cap + 1);
+        let mut expanded: Vec<bool> = Vec::with_capacity(cap + 1);
+        pool.push(entry_node);
+        expanded.push(false);
+
+        // With `lambda > 0`, unexpanded nodes outside the pool that are still within the
+        // relaxation. They are all worse than every pool entry, because the worst pool entry is
+        // only ever replaced by a better one. With `lambda = 0` it stays empty, apart from ties.
+        let mut tail: BinaryHeap<Reverse<ScoredItemGeneric<Dist<D>, usize>>> = BinaryHeap::new();
+
+        let mut visited_table = create_visited_set(cap, lambda, self.avg_degree(), self.n_nodes());
+        visited_table.insert(entry_node.vector);
+        let mut neighbors_buf: Vec<u32> = Vec::new();
+
+        // Whether `d` is within the relaxation of the `ef`-th best distance in `pool`.
+        let eligible = |pool: &[ScoredItemGeneric<Dist<D>, usize>], d: &Dist<D>| {
+            pool.len() < ef || d.is_within_relaxation(&pool[ef - 1].distance, lambda)
+        };
+
+        // Every entry before `cursor` is expanded.
+        let mut cursor = 0usize;
+        loop {
+            while cursor < pool.len() && expanded[cursor] {
+                cursor += 1;
+            }
+            // Distances are sorted, and every node in `tail` is worse than the pool. So once a
+            // candidate is not eligible, no later candidate is. The search then stops, unless it
+            // has scored fewer than `k` nodes. In that case it keeps expanding the best
+            // unexpanded nodes until it has `k` nodes or none is left. The pool is then not
+            // full, so `tail` is empty.
+            let id_candidate = if cursor < pool.len() {
+                if !eligible(&pool, &pool[cursor].distance) && pool.len() >= k {
+                    break;
+                }
+                expanded[cursor] = true;
+                pool[cursor].vector
+            } else {
+                match tail.pop() {
+                    Some(Reverse(node)) if eligible(&pool, &node.distance) => node.vector,
+                    _ => break,
+                }
+            };
+
+            let neighbors = self.neighbors(id_candidate, &mut neighbors_buf);
+            for &neighbor_local_id in neighbors {
+                let range = dataset
+                    .range_from_id(self.get_external_id(neighbor_local_id as usize) as VectorId);
+                dataset.prefetch_with_range(range, 256);
+            }
+
+            // Lowest position where a node was inserted. The scan restarts from there.
+            let mut min_pos = usize::MAX;
+            let mut insert = |local_id: usize, distance: Dist<D>| {
+                let node = ScoredItemGeneric {
+                    distance,
+                    vector: local_id,
+                };
+                let len = pool.len();
+                if len >= cap && !(distance < pool[len - 1].distance) {
+                    // Not among the best `cap`: keep it only if it may still be expanded.
+                    if lambda > 0.0 && eligible(&pool, &distance) {
+                        tail.push(Reverse(node));
+                    }
+                    return;
+                }
+                let pos = pool.partition_point(|e| e.distance <= distance);
+                pool.insert(pos, node);
+                expanded.insert(pos, false);
+                min_pos = min_pos.min(pos);
+                if pool.len() > cap {
+                    let evicted = pool.pop().unwrap();
+                    let evicted_expanded = expanded.pop().unwrap();
+                    if lambda > 0.0 && !evicted_expanded && eligible(&pool, &evicted.distance) {
+                        tail.push(Reverse(evicted));
+                    }
+                }
+            };
+
+            let mut buf_local: [usize; 6] = [0; 6];
+            let mut buf_ext: [VectorId; 6] = [0; 6];
+            let mut count = 0usize;
+            for &neighbor_local_id in neighbors {
+                let neighbor_local_id = neighbor_local_id as usize;
+                if visited_table.insert(neighbor_local_id) {
+                    buf_local[count] = neighbor_local_id;
+                    buf_ext[count] = self.get_external_id(neighbor_local_id) as VectorId;
+                    count += 1;
+                    if count == 6 {
+                        let dists = query_evaluator.compute_distances_batch6([
+                            dataset.get(buf_ext[0]),
+                            dataset.get(buf_ext[1]),
+                            dataset.get(buf_ext[2]),
+                            dataset.get(buf_ext[3]),
+                            dataset.get(buf_ext[4]),
+                            dataset.get(buf_ext[5]),
+                        ]);
+                        for i in 0..6 {
+                            insert(buf_local[i], dists[i]);
+                        }
+                        count = 0;
+                    }
+                }
+            }
+            for i in 0..count {
+                let d = query_evaluator.compute_distance(dataset.get(buf_ext[i]));
+                insert(buf_local[i], d);
+            }
+            cursor = cursor.min(min_pos);
+        }
+        pool.truncate(k);
+        pool
     }
 
-    /// Search candidates for a query (uses efSearch and top-k pruning).
-    #[must_use]
-    fn search_candidates_for_query<'e, D>(
-        &self,
-        dataset: &'e D,
-        entry_node: ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>,
-        query_evaluator: &<D::Encoder as VectorEncoder>::Evaluator<'e>,
-        ef_search: usize,
-        k: usize,
-        lambda: f32,
-    ) -> BinaryHeap<ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>>
-    where
-        D: Dataset + Sync,
-        <D::Encoder as VectorEncoder>::Distance: Distance,
-    {
-        self.search_candidates_impl(
-            dataset,
-            entry_node,
-            query_evaluator,
-            ef_search,
-            Some(k),
-            lambda,
-        )
-    }
-
-    /// Search candidates for insertion (uses efConstruction, no top-k pruning).
+    /// Search for insertion candidates. It runs a beam search with beam width `ef`
+    /// (efConstruction) and returns the `ef` nearest nodes found, as a max-heap.
     #[must_use]
     fn search_candidates_for_insert<'e, D>(
         &self,
         dataset: &'e D,
         entry_node: ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>,
         query_evaluator: &<D::Encoder as VectorEncoder>::Evaluator<'e>,
-        ef_construction: usize,
-    ) -> BinaryHeap<ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>>
-    where
-        D: Dataset + Sync,
-        <D::Encoder as VectorEncoder>::Distance: Distance,
-    {
-        self.search_candidates_impl(
-            dataset,
-            entry_node,
-            query_evaluator,
-            ef_construction,
-            None,
-            0.0,
-        )
-    }
-
-    /// Shared implementation for candidate search.
-    #[must_use]
-    fn search_candidates_impl<'e, D>(
-        &self,
-        dataset: &'e D,
-        entry_node: ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>,
-        query_evaluator: &<D::Encoder as VectorEncoder>::Evaluator<'e>,
         ef: usize,
-        k: Option<usize>,
-        lambda: f32,
     ) -> BinaryHeap<ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>>
     where
         D: Dataset + Sync,
@@ -224,7 +280,7 @@ pub trait GraphTrait {
             Reverse<ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>>,
         > = BinaryHeap::with_capacity(ef);
 
-        let mut visited_table = create_visited_set(ef, lambda, self.avg_degree(), self.n_nodes());
+        let mut visited_table = create_visited_set(ef, 0.0, self.avg_degree(), self.n_nodes());
 
         // Scratch for `neighbors`, reused for every expanded node. The slice it backs is walked
         // twice, to prefetch and to score: producing the list twice would make the compressed
@@ -240,11 +296,11 @@ pub trait GraphTrait {
             let id_candidate = node.vector;
             let distance_candidate = node.distance;
 
-            if top_candidates.len() >= ef.max(k.unwrap_or(0)) {
+            if top_candidates.len() >= ef {
                 // Standard HNSW termination: stop when the best remaining candidate
                 // is worse than the worst result collected so far.
                 let worst_top = &top_candidates.peek().unwrap().distance;
-                if !distance_candidate.is_within_relaxation(worst_top, lambda) {
+                if !distance_candidate.is_within_relaxation(worst_top, 0.0) {
                     break;
                 }
             }
@@ -278,7 +334,7 @@ pub trait GraphTrait {
                 } else if let Some(top_node) = top_candidates.peek() {
                     candidate
                         .distance
-                        .is_within_relaxation(&top_node.distance, lambda)
+                        .is_within_relaxation(&top_node.distance, 0.0)
                 } else {
                     false
                 };
@@ -551,7 +607,7 @@ pub trait GraphTrait {
                     vector: neighbor_local,
                 };
 
-                // Gate on W's current frontier — same threshold as search_candidates_impl.
+                // Gate on W's current frontier — same threshold as search_candidates_for_insert.
                 let should_add = if top_candidates.len() < ef {
                     true
                 } else if let Some(top) = top_candidates.peek() {
@@ -684,16 +740,10 @@ mod tests {
         assert!(neighbors.len() <= 4);
     }
 
-    /// Regression test for the 2026-03-06 early-termination bug.
-    ///
-    /// `search_candidates_for_insert` passes `k=None` to `search_candidates_impl`.
-    /// Before the fix, `if let Some(k_limit) = k && ...` never fired for k=None,
-    /// so the loop drained the entire candidate queue. The fix uses `k.unwrap_or(0)`,
-    /// making termination fire as soon as `top_candidates.len() >= ef`.
-    ///
-    /// This test verifies:
+    /// The insertion search stops once it holds `ef` results and no remaining candidate is
+    /// closer than the worst of them. This test verifies:
     /// 1. The returned heap is bounded by ef.
-    /// 2. The true nearest neighbour is found (search is still correct after the fix).
+    /// 2. The true nearest neighbour is found.
     #[test]
     fn search_candidates_for_insert_bounded_by_ef_and_finds_nearest() {
         let n = 20usize;
@@ -728,9 +778,9 @@ mod tests {
         assert_eq!(best.distance, SquaredEuclideanDistance::from(0.0));
     }
 
-    /// Verify the `k=Some` path (`search_candidates_for_query`) is also bounded and correct.
+    /// Verify the query path (`beam_search`) returns `k` sorted results and is correct.
     #[test]
-    fn search_candidates_for_query_bounded_and_correct() {
+    fn beam_search_bounded_and_correct() {
         let n = 20usize;
         let ef = 6usize;
         let k = 3usize;
@@ -749,11 +799,10 @@ mod tests {
             vector: 0usize,
         };
 
-        let top_heap = graph.search_candidates_for_query(&dataset, entry, &evaluator, ef, k, 0.0);
+        let results = graph.beam_search(&dataset, entry, &evaluator, k, ef, 0.0);
 
-        assert!(top_heap.len() <= ef);
-        let mut results = top_heap.into_sorted_vec();
-        results.truncate(k);
+        assert_eq!(results.len(), k);
+        assert!(results.windows(2).all(|w| w[0].distance <= w[1].distance));
 
         assert_eq!(
             results[0].vector, 5,
@@ -761,6 +810,39 @@ mod tests {
             results[0].vector
         );
         assert_eq!(results[0].distance, SquaredEuclideanDistance::from(0.0));
+    }
+
+    /// With `ef` far below `k`, the beam search alone would stop after scoring fewer than `k`
+    /// nodes. On a line graph with `ef = 1`, it walks from node 0 to node 5 and stops after
+    /// scoring only nodes 0..=6. The search must keep expanding until it has `k` results.
+    #[test]
+    fn beam_search_returns_k_when_ef_is_tiny() {
+        let n = 20usize;
+        let encoder = PlainDenseQuantizer::<f32, SquaredEuclideanDistance>::new(1);
+        let flat: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let dataset = DenseDataset::from_raw(flat.into_boxed_slice(), n, encoder);
+        let graph = build_line_graph(n, 4);
+
+        let query_val = [5.0f32];
+        let query = DenseVectorView::new(&query_val);
+        let evaluator = dataset.encoder().query_evaluator(query, &());
+        let entry = ScoredItemGeneric {
+            distance: evaluator.compute_distance(dataset.get(0)),
+            vector: 0usize,
+        };
+
+        for lambda in [0.0, 0.1] {
+            // The 15 nearest to 5.0 are nodes 0..=14 (node 15 is at distance 10).
+            let results = graph.beam_search(&dataset, entry, &evaluator, 15, 1, lambda);
+            let mut ids: Vec<usize> = results.iter().map(|r| r.vector).collect();
+            assert_eq!(results[0].vector, 5);
+            ids.sort_unstable();
+            assert_eq!(ids, (0..15).collect::<Vec<_>>(), "lambda={lambda}");
+
+            // `k` larger than the graph: every node is returned once.
+            let all = graph.beam_search(&dataset, entry, &evaluator, 50, 1, lambda);
+            assert_eq!(all.len(), n, "lambda={lambda}");
+        }
     }
 
     /// All results from `acorn_search_candidates_filtered` must satisfy the predicate.
