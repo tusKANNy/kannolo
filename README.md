@@ -224,7 +224,7 @@ versions, configurations and instructions that reproduce the results of our pape
 [**papers_reproducibility**](https://github.com/tusKANNy/papers_reproducibility).
 
 
-## 📚 Bibliography
+## Bibliography
 
 1. Leonardo Delfino, Domenico Erriquez, Silvio Martinico, Franco Maria Nardini, Cosimo Rulli and Rossano Venturini. "*kANNolo: Sweet and Smooth Approximate k-Nearest Neighbors Search*." Proc. ECIR. 2025.
 2. Silvio Martinico, Franco Maria Nardini, Cosimo Rulli and Rossano Venturini. "*Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo*." 2026. [ArXiv](https://arxiv.org/abs/2611.03927). Submitted to *Elsevier Information Systems*.
