@@ -256,3 +256,6 @@ ArXiv 2026 (Submitted to *Elsevier Information Systems*):
 
 ### Citation License
 The source code in this repository is subject to the following citation license: **By downloading and using this software, you agree to cite the papers listed in the Bibliography section above in any kind of material you produce where it was used to conduct a search or experimentation, whether it be a research paper, dissertation, article, poster, presentation, or documentation. By using this software, you have agreed to the citation license.**
+
+## License
+This software is released under the **MIT License** (see [LICENSE](LICENSE)).
