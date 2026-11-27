@@ -1,6 +1,6 @@
 <h1>
-    <img height="72" align="center" alt="" src="https://silviom97.github.io/assets/img/logos/kannolo.webp" />
-
+    <img height="100" align="center" alt="" src="https://silviom97.github.io/assets/img/logos/kannolo.webp" />
+    &nbsp;&nbsp;&nbsp;kANNolo
 </h1>
 
 <p align="center">
