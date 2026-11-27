@@ -1,6 +1,6 @@
 <h1>
     <img height="72" align="center" alt="" src="https://silviom97.github.io/assets/img/logos/kannolo.webp" />
-    &nbsp;&nbsp;&nbsp;kANNolo
+
 </h1>
 
 <p align="center">
@@ -216,6 +216,7 @@ However, LLVM can no longer inline across units, and **search is about 2% slower
 **Data formats:** dense collections are `.npy` (`float32`), sparse collections use the Seismic binary
 format. [`scripts/`](scripts/) converts between the two.
 
+
 ## Reproducing our papers
 
 kANNolo keeps evolving, so this repository does not track the exact setup of any paper. The
@@ -259,7 +260,7 @@ ArXiv 2026 (Submitted to *Elsevier Information Systems*):
 }
 ```
 
-### Citation License
+## Citation License
 The source code in this repository is subject to the following citation license: **By downloading and using this software, you agree to cite the papers listed in the Bibliography section above in any kind of material you produce where it was used to conduct a search or experimentation, whether it be a research paper, dissertation, article, poster, presentation, or documentation. By using this software, you have agreed to the citation license**.
 
 
