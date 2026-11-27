@@ -251,6 +251,14 @@ where
     pub fn get_ground_level(&self) -> &G {
         &self.levels[self.levels.len() - 1]
     }
+
+    /// Returns the dataset the graph is built on, in local-ID order (see
+    /// [`Self::get_original_id`] for permuted indexes).
+    #[must_use]
+    #[inline]
+    pub fn dataset(&self) -> &D {
+        &self.dataset
+    }
 }
 
 impl<D, G> HNSW<D, G>
