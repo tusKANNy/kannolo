@@ -9,10 +9,6 @@
 </p>
 
 <p align="center">
-    <!-- crates.io is stale (0.3.8) until the next crates.io release; restore these then.
-    <a href="https://crates.io/crates/kannolo"><img src="https://badgen.infra.medigy.com/crates/v/kannolo" /></a>
-    <a href="https://crates.io/crates/kannolo"><img src="https://badgen.infra.medigy.com/crates/d/kannolo" /></a>
-    -->
     <a href="https://pypi.org/project/kannolo/"><img src="https://badgen.net/pypi/v/kannolo" /></a>
     <a href="LICENSE"><img src="https://badgen.net/static/license/MIT/blue" /></a>
 </p>
