@@ -11,6 +11,9 @@
 <p align="center">
     <a href="https://pypi.org/project/kannolo/"><img src="https://badgen.net/pypi/v/kannolo" /></a>
     <a href="LICENSE"><img src="https://badgen.net/static/license/MIT/blue" /></a>
+    <a href="https://pepy.tech/projects/kannolo"><img src="https://static.pepy.tech/badge/kannolo" /></a>
+    <a href="https://pepy.tech/projects/kannolo"><img src="https://static.pepy.tech/badge/kannolo/month" /></a>
+    <a href="https://github.com/TusKANNy/kannolo/stargazers"><img src="https://badgen.net/github/stars/TusKANNy/kannolo" /></a>
 </p>
 
 **Fast, compact approximate nearest neighbor indexes for dense, sparse and multi-vector embeddings, in Rust 🦀 with Python bindings.**
